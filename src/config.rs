@@ -43,7 +43,7 @@ impl Config {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.port == 0 {
             return Err("port must not be 0".to_string());
         }
