@@ -4,7 +4,9 @@ mod http;
 use clap::Parser;
 use config::Config;
 use http::chunked::decode_chunked;
-use http::parser::{BodyFraming, ParseError, ParseResult, body_framing, parse_request};
+use http::parser::{body_framing, parse_request, BodyFraming, ParseError, ParseResult};
+use http::request::Method;
+use http::response::Response;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -106,7 +108,6 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
         BodyFraming::None => {}
 
         BodyFraming::ContentLength(length) => {
-            // Some body bytes may already have arrived together with the headers.
             let mut body = buffer[consumed..].to_vec();
             while body.len() < length {
                 let n = stream.read(&mut chunk).await?;
@@ -116,13 +117,11 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
                 }
                 body.extend_from_slice(&chunk[..n]);
             }
-            // Drop anything beyond the declared length (we close after each response).
             body.truncate(length);
             request.body = body;
         }
 
         BodyFraming::Chunked => {
-            // Keep only the bytes that come after the headers.
             buffer.drain(..consumed);
             let mut body: Vec<u8> = Vec::new();
             let mut pos = 0;
@@ -137,7 +136,6 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
                     }
                 }
 
-                // Forget bytes we already decoded so the buffer stays small.
                 buffer.drain(..pos);
                 pos = 0;
 
@@ -160,40 +158,37 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
     );
 
     // For now, echo back what we understood.
-    let mut body = format!(
+    let mut text = format!(
         "Method: {:?}\nPath: {}\nVersion: {:?}\n\nHeaders:\n",
         request.method, request.target, request.version
     );
     for (name, value) in &request.headers {
-        body.push_str(&format!("  {name}: {value}\n"));
+        text.push_str(&format!("  {name}: {value}\n"));
     }
-    body.push_str(&format!(
+    text.push_str(&format!(
         "\nBody ({} bytes):\n{}\n",
         request.body.len(),
         String::from_utf8_lossy(&request.body)
     ));
 
-    send_response(&mut stream, 200, "OK", &body).await
+    let response = Response::text(200, text);
+    let include_body = request.method != Method::Head;
+    send(&mut stream, response, include_body).await
+}
+
+/// Write a response to the client.
+async fn send(
+    stream: &mut TcpStream,
+    response: Response,
+    include_body: bool,
+) -> std::io::Result<()> {
+    stream.write_all(&response.to_bytes(include_body)).await?;
+    stream.flush().await
 }
 
 /// Log a rejected request and tell the client why.
 async fn reject(stream: &mut TcpStream, e: ParseError) -> std::io::Result<()> {
     warn!("rejected request: {e:?}");
-    let body = format!("{} {}\n", e.status_code(), e.reason_phrase());
-    send_response(stream, e.status_code(), e.reason_phrase(), &body).await
-}
-
-async fn send_response(
-    stream: &mut TcpStream,
-    status: u16,
-    reason: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
+    let message = format!("{} {}\n", e.status_code(), e.reason_phrase());
+    send(stream, Response::text(e.status_code(), message), true).await
 }
