@@ -12,6 +12,8 @@ pub enum ParseError {
     UriTooLong,
     HeadersTooLarge,
     VersionNotSupported,
+    PayloadTooLarge,
+    NotImplemented,
 }
 
 impl ParseError {
@@ -21,6 +23,8 @@ impl ParseError {
             ParseError::UriTooLong => 414,
             ParseError::HeadersTooLarge => 431,
             ParseError::VersionNotSupported => 505,
+            ParseError::PayloadTooLarge => 413,
+            ParseError::NotImplemented => 501,
         }
     }
 
@@ -30,6 +34,8 @@ impl ParseError {
             ParseError::UriTooLong => "URI Too Long",
             ParseError::HeadersTooLarge => "Request Header Fields Too Large",
             ParseError::VersionNotSupported => "HTTP Version Not Supported",
+            ParseError::PayloadTooLarge => "Payload Too Large",
+            ParseError::NotImplemented => "Not Implemented",
         }
     }
 }
@@ -92,6 +98,7 @@ pub fn parse_request(buf: &[u8], max_header_bytes: usize) -> Result<ParseResult,
         target: target.to_string(),
         version,
         headers,
+        body: Vec::new(),
     };
 
     // HTTP/1.1 requires a Host header.
@@ -100,6 +107,55 @@ pub fn parse_request(buf: &[u8], max_header_bytes: usize) -> Result<ParseResult,
     }
 
     Ok(ParseResult::Complete { request, consumed })
+}
+
+/// How the body of a request is delimited.
+#[derive(Debug, PartialEq)]
+pub enum BodyFraming {
+    /// No body to read.
+    None,
+    /// Exactly this many bytes follow the headers.
+    ContentLength(usize),
+}
+
+/// Work out whether a request has a body and how long it is.
+/// Strict on purpose: unclear framing is rejected, never guessed.
+pub fn body_framing(request: &Request, max_body_bytes: usize) -> Result<BodyFraming, ParseError> {
+    if request.header("transfer-encoding").is_some() {
+        // Both headers present is the classic request smuggling trick.
+        if request.header("content-length").is_some() {
+            return Err(ParseError::BadRequest(
+                "both Content-Length and Transfer-Encoding",
+            ));
+        }
+        // Chunked bodies come in Step 2c.
+        return Err(ParseError::NotImplemented);
+    }
+
+    let mut length: Option<usize> = None;
+    for (name, value) in &request.headers {
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        // Digits only: no signs, spaces, or hex.
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ParseError::BadRequest("invalid Content-Length"));
+        }
+        // A number too big to even fit counts as too large, not a crash.
+        let parsed: usize = value.parse().map_err(|_| ParseError::PayloadTooLarge)?;
+        match length {
+            Some(existing) if existing != parsed => {
+                return Err(ParseError::BadRequest("conflicting Content-Length headers"));
+            }
+            _ => length = Some(parsed),
+        }
+    }
+
+    match length {
+        None | Some(0) => Ok(BodyFraming::None),
+        Some(n) if n > max_body_bytes => Err(ParseError::PayloadTooLarge),
+        Some(n) => Ok(BodyFraming::ContentLength(n)),
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +267,79 @@ mod tests {
             }
             ParseResult::Incomplete => panic!("expected a complete request"),
         }
+    }
+
+    /// Build a POST request with extra headers, for testing.
+    fn request_with(extra_headers: &str) -> Request {
+        let raw = format!("POST /submit HTTP/1.1\r\nHost: x\r\n{extra_headers}\r\n");
+        match parse_request(raw.as_bytes(), 8192).unwrap() {
+            ParseResult::Complete { request, .. } => request,
+            ParseResult::Incomplete => panic!("expected a complete request"),
+        }
+    }
+
+    #[test]
+    fn no_body_headers_means_no_body() {
+        let req = request_with("");
+        assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::None));
+    }
+
+    #[test]
+    fn content_length_is_understood() {
+        let req = request_with("Content-Length: 5\r\n");
+        assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::ContentLength(5)));
+    }
+
+    #[test]
+    fn identical_duplicate_lengths_are_allowed() {
+        let req = request_with("Content-Length: 5\r\nContent-Length: 5\r\n");
+        assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::ContentLength(5)));
+    }
+
+    #[test]
+    fn conflicting_lengths_are_rejected() {
+        let req = request_with("Content-Length: 5\r\nContent-Length: 6\r\n");
+        assert!(matches!(
+            body_framing(&req, 1000),
+            Err(ParseError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn non_numbers_are_rejected() {
+        for bad in ["abc", "-5", "+5", "5 5", "0x10"] {
+            let req = request_with(&format!("Content-Length: {bad}\r\n"));
+            assert!(
+                matches!(body_framing(&req, 1000), Err(ParseError::BadRequest(_))),
+                "should reject Content-Length: {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_length_and_transfer_encoding_is_rejected() {
+        let req = request_with("Content-Length: 5\r\nTransfer-Encoding: chunked\r\n");
+        assert!(matches!(
+            body_framing(&req, 1000),
+            Err(ParseError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_encoding_alone_is_not_implemented_yet() {
+        let req = request_with("Transfer-Encoding: chunked\r\n");
+        assert_eq!(body_framing(&req, 1000), Err(ParseError::NotImplemented));
+    }
+
+    #[test]
+    fn too_large_bodies_are_rejected() {
+        let req = request_with("Content-Length: 2000\r\n");
+        assert_eq!(body_framing(&req, 1000), Err(ParseError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn absurdly_large_numbers_do_not_crash() {
+        let req = request_with("Content-Length: 99999999999999999999999999\r\n");
+        assert_eq!(body_framing(&req, 1000), Err(ParseError::PayloadTooLarge));
     }
 }

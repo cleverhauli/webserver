@@ -3,7 +3,7 @@ mod http;
 
 use clap::Parser;
 use config::Config;
-use http::parser::{ParseResult, parse_request};
+use http::parser::{BodyFraming, ParseError, ParseResult, body_framing, parse_request};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,7 +50,6 @@ async fn main() -> std::io::Result<()> {
     }
 
     let address = config.address();
-    // Arc lets many connection tasks share one read-only copy of the config.
     let config = Arc::new(config);
 
     let listener = TcpListener::bind(&address).await?;
@@ -73,8 +72,8 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
 
-    // Keep reading until we have a complete request, or something goes wrong.
-    let request = loop {
+    // Step 1: read until we have all the headers.
+    let (mut request, consumed) = loop {
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
             debug!("client closed the connection before sending a full request");
@@ -83,18 +82,47 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
         buffer.extend_from_slice(&chunk[..n]);
 
         match parse_request(&buffer, config.max_header_bytes) {
-            Ok(ParseResult::Complete { request, .. }) => break request,
+            Ok(ParseResult::Complete { request, consumed }) => break (request, consumed),
             Ok(ParseResult::Incomplete) => continue,
             Err(e) => {
-                warn!("rejected request: {e:?}");
-                let body = format!("{} {}\n", e.status_code(), e.reason_phrase());
-                send_response(&mut stream, e.status_code(), e.reason_phrase(), &body).await?;
+                reject(&mut stream, e).await?;
                 return Ok(());
             }
         }
     };
 
-    info!("{:?} {}", request.method, request.target);
+    // Step 2: decide whether there is a body, and how long it is.
+    let framing = match body_framing(&request, config.max_body_bytes) {
+        Ok(framing) => framing,
+        Err(e) => {
+            reject(&mut stream, e).await?;
+            return Ok(());
+        }
+    };
+
+    // Step 3: read exactly that many body bytes.
+    if let BodyFraming::ContentLength(length) = framing {
+        // Some body bytes may already have arrived together with the headers.
+        let mut body = buffer[consumed..].to_vec();
+        while body.len() < length {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                debug!("client closed the connection before sending the full body");
+                return Ok(());
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        // Drop anything beyond the declared length (we close after each response).
+        body.truncate(length);
+        request.body = body;
+    }
+
+    info!(
+        "{:?} {} (body: {} bytes)",
+        request.method,
+        request.target,
+        request.body.len()
+    );
 
     // For now, echo back what we understood.
     let mut body = format!(
@@ -104,8 +132,20 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
     for (name, value) in &request.headers {
         body.push_str(&format!("  {name}: {value}\n"));
     }
+    body.push_str(&format!(
+        "\nBody ({} bytes):\n{}\n",
+        request.body.len(),
+        String::from_utf8_lossy(&request.body)
+    ));
 
     send_response(&mut stream, 200, "OK", &body).await
+}
+
+/// Log a rejected request and tell the client why.
+async fn reject(stream: &mut TcpStream, e: ParseError) -> std::io::Result<()> {
+    warn!("rejected request: {e:?}");
+    let body = format!("{} {}\n", e.status_code(), e.reason_phrase());
+    send_response(stream, e.status_code(), e.reason_phrase(), &body).await
 }
 
 async fn send_response(

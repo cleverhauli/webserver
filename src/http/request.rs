@@ -39,6 +39,7 @@ pub struct Request {
     pub target: String,
     pub version: Version,
     pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl Request {
