@@ -1,10 +1,22 @@
+mod config;
+
+use config::Config;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:8080").await?;
-    println!("Listening on http://127.0.0.1:8080");
+    let config = match Config::load("config.toml") {
+        Ok(config) => config,
+        Err(message) => {
+            eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+    };
+
+    let address = config.address();
+    let listener = TcpListener::bind(&address).await?;
+    println!("Listening on http://{address}");
 
     loop {
         let (stream, addr) = listener.accept().await?;
