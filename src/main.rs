@@ -3,6 +3,7 @@ mod http;
 
 use clap::Parser;
 use config::Config;
+use http::chunked::decode_chunked;
 use http::parser::{BodyFraming, ParseError, ParseResult, body_framing, parse_request};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,7 +92,7 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
         }
     };
 
-    // Step 2: decide whether there is a body, and how long it is.
+    // Step 2: decide whether there is a body, and how it is delimited.
     let framing = match body_framing(&request, config.max_body_bytes) {
         Ok(framing) => framing,
         Err(e) => {
@@ -100,21 +101,55 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
         }
     };
 
-    // Step 3: read exactly that many body bytes.
-    if let BodyFraming::ContentLength(length) = framing {
-        // Some body bytes may already have arrived together with the headers.
-        let mut body = buffer[consumed..].to_vec();
-        while body.len() < length {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                debug!("client closed the connection before sending the full body");
-                return Ok(());
+    // Step 3: read the body.
+    match framing {
+        BodyFraming::None => {}
+
+        BodyFraming::ContentLength(length) => {
+            // Some body bytes may already have arrived together with the headers.
+            let mut body = buffer[consumed..].to_vec();
+            while body.len() < length {
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    debug!("client closed the connection before sending the full body");
+                    return Ok(());
+                }
+                body.extend_from_slice(&chunk[..n]);
             }
-            body.extend_from_slice(&chunk[..n]);
+            // Drop anything beyond the declared length (we close after each response).
+            body.truncate(length);
+            request.body = body;
         }
-        // Drop anything beyond the declared length (we close after each response).
-        body.truncate(length);
-        request.body = body;
+
+        BodyFraming::Chunked => {
+            // Keep only the bytes that come after the headers.
+            buffer.drain(..consumed);
+            let mut body: Vec<u8> = Vec::new();
+            let mut pos = 0;
+
+            loop {
+                match decode_chunked(&buffer, &mut pos, &mut body, config.max_body_bytes) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(e) => {
+                        reject(&mut stream, e).await?;
+                        return Ok(());
+                    }
+                }
+
+                // Forget bytes we already decoded so the buffer stays small.
+                buffer.drain(..pos);
+                pos = 0;
+
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    debug!("client closed the connection in the middle of a chunked body");
+                    return Ok(());
+                }
+                buffer.extend_from_slice(&chunk[..n]);
+            }
+            request.body = body;
+        }
     }
 
     info!(

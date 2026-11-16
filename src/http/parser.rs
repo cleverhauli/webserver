@@ -116,19 +116,37 @@ pub enum BodyFraming {
     None,
     /// Exactly this many bytes follow the headers.
     ContentLength(usize),
+    /// The body arrives as a series of chunks.
+    Chunked,
 }
 
-/// Work out whether a request has a body and how long it is.
+/// Work out whether a request has a body and how it is delimited.
 /// Strict on purpose: unclear framing is rejected, never guessed.
 pub fn body_framing(request: &Request, max_body_bytes: usize) -> Result<BodyFraming, ParseError> {
-    if request.header("transfer-encoding").is_some() {
+    let mut encodings = request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"));
+
+    if let Some((_, value)) = encodings.next() {
+        if encodings.next().is_some() {
+            return Err(ParseError::BadRequest("multiple Transfer-Encoding headers"));
+        }
+        if request.version == Version::Http10 {
+            return Err(ParseError::BadRequest(
+                "Transfer-Encoding is not allowed in HTTP/1.0",
+            ));
+        }
         // Both headers present is the classic request smuggling trick.
         if request.header("content-length").is_some() {
             return Err(ParseError::BadRequest(
                 "both Content-Length and Transfer-Encoding",
             ));
         }
-        // Chunked bodies come in Step 2c.
+        if value.eq_ignore_ascii_case("chunked") {
+            return Ok(BodyFraming::Chunked);
+        }
+        // Other encodings (like gzip) are not supported.
         return Err(ParseError::NotImplemented);
     }
 
@@ -326,12 +344,6 @@ mod tests {
     }
 
     #[test]
-    fn transfer_encoding_alone_is_not_implemented_yet() {
-        let req = request_with("Transfer-Encoding: chunked\r\n");
-        assert_eq!(body_framing(&req, 1000), Err(ParseError::NotImplemented));
-    }
-
-    #[test]
     fn too_large_bodies_are_rejected() {
         let req = request_with("Content-Length: 2000\r\n");
         assert_eq!(body_framing(&req, 1000), Err(ParseError::PayloadTooLarge));
@@ -341,5 +353,45 @@ mod tests {
     fn absurdly_large_numbers_do_not_crash() {
         let req = request_with("Content-Length: 99999999999999999999999999\r\n");
         assert_eq!(body_framing(&req, 1000), Err(ParseError::PayloadTooLarge));
+    }
+
+        #[test]
+    fn chunked_is_understood() {
+        let req = request_with("Transfer-Encoding: chunked\r\n");
+        assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::Chunked));
+    }
+
+    #[test]
+    fn chunked_name_and_value_ignore_case() {
+        let req = request_with("transfer-encoding: CHUNKED\r\n");
+        assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::Chunked));
+    }
+
+    #[test]
+    fn other_encodings_are_not_implemented() {
+        let req = request_with("Transfer-Encoding: gzip, chunked\r\n");
+        assert_eq!(body_framing(&req, 1000), Err(ParseError::NotImplemented));
+    }
+
+    #[test]
+    fn duplicate_transfer_encoding_is_rejected() {
+        let req = request_with("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n");
+        assert!(matches!(
+            body_framing(&req, 1000),
+            Err(ParseError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn transfer_encoding_in_http10_is_rejected() {
+        let raw = b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let request = match parse_request(raw, 8192).unwrap() {
+            ParseResult::Complete { request, .. } => request,
+            ParseResult::Incomplete => panic!("expected a complete request"),
+        };
+        assert!(matches!(
+            body_framing(&request, 1000),
+            Err(ParseError::BadRequest(_))
+        ));
     }
 }
