@@ -3,5 +3,13 @@ port = 9090
 document_root = "public"
 max_header_bytes = 8192
 max_body_bytes = 1048576
+
+# Seconds a client has to send the request headers, and then again for the
+# body. This is a TOTAL deadline, so sending one byte at a time doesn't help.
 read_timeout_secs = 10
+
+# Seconds a single write to a client may stall before we give up on it.
+write_timeout_secs = 30
+
+# Most connections handled at once. Extra ones get "503 Service Unavailable".
 max_connections = 1000
