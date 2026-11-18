@@ -12,6 +12,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     pub read_timeout_secs: u64,
     pub write_timeout_secs: u64,
+    pub keep_alive_timeout_secs: u64,
+    pub max_requests_per_connection: usize,
     pub max_connections: usize,
 }
 
@@ -25,6 +27,8 @@ impl Default for Config {
             max_body_bytes: 1_048_576,
             read_timeout_secs: 10,
             write_timeout_secs: 30,
+            keep_alive_timeout_secs: 5,
+            max_requests_per_connection: 100,
             max_connections: 1000,
         }
     }
@@ -57,6 +61,12 @@ impl Config {
         }
         if self.write_timeout_secs == 0 {
             return Err("write_timeout_secs must be at least 1".to_string());
+        }
+        if self.keep_alive_timeout_secs == 0 {
+            return Err("keep_alive_timeout_secs must be at least 1".to_string());
+        }
+        if self.max_requests_per_connection == 0 {
+            return Err("max_requests_per_connection must be at least 1".to_string());
         }
         Ok(())
     }
@@ -94,7 +104,7 @@ mod tests {
     fn wrong_type_is_rejected() {
         assert!(Config::from_toml_str("port = \"abc\"").is_err());
     }
-    
+
     #[test]
     fn write_timeout_has_a_default() {
         let config = Config::from_toml_str("").unwrap();
@@ -105,5 +115,18 @@ mod tests {
     fn zero_timeouts_are_rejected() {
         assert!(Config::from_toml_str("write_timeout_secs = 0").is_err());
         assert!(Config::from_toml_str("read_timeout_secs = 0").is_err());
+    }
+
+    #[test]
+    fn keep_alive_settings_have_defaults() {
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.keep_alive_timeout_secs, 5);
+        assert_eq!(config.max_requests_per_connection, 100);
+    }
+
+    #[test]
+    fn zero_keep_alive_settings_are_rejected() {
+        assert!(Config::from_toml_str("keep_alive_timeout_secs = 0").is_err());
+        assert!(Config::from_toml_str("max_requests_per_connection = 0").is_err());
     }
 }

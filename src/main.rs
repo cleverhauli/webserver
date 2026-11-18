@@ -1,4 +1,5 @@
 mod config;
+mod connection;
 mod handlers;
 mod http;
 mod net_util;
@@ -7,11 +8,11 @@ mod static_files;
 
 use clap::Parser;
 use config::Config;
-use http::chunked::decode_chunked;
-use http::parser::{body_framing, parse_request, BodyFraming, ParseError, ParseResult};
+use connection::{client_allows_keep_alive, read_request, Failure, Incoming};
+use http::parser::ParseError;
 use http::request::Method;
 use http::response::{FileSlice, Response};
-use net_util::{is_routine_disconnect, read_with_deadline, write_all_timeout, ReadOutcome};
+use net_util::{is_routine_disconnect, write_all_timeout};
 use router::Router;
 use std::io::SeekFrom;
 use std::sync::Arc;
@@ -19,7 +20,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Command-line options.
@@ -78,6 +78,10 @@ async fn main() -> std::io::Result<()> {
         "Limits: {} connections, {}s to send a request, {}s write timeout",
         config.max_connections, config.read_timeout_secs, config.write_timeout_secs
     );
+    info!(
+        "Keep-alive: {}s idle wait, up to {} requests per connection",
+        config.keep_alive_timeout_secs, config.max_requests_per_connection
+    );
 
     let write_timeout = Duration::from_secs(config.write_timeout_secs);
     // The semaphore hands out one "permit" per connection we are willing to
@@ -123,6 +127,7 @@ async fn main() -> std::io::Result<()> {
                     error!("{addr}: connection error: {e}");
                 }
             }
+            debug!("{addr}: connection closed");
         });
     }
 }
@@ -133,150 +138,93 @@ async fn refuse_busy(mut stream: TcpStream, write_timeout: Duration) {
     let _ = write_all_timeout(&mut stream, &response.to_bytes(true), write_timeout).await;
 }
 
+/// Serve requests on one connection until it should close.
 async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<Config>,
     router: Arc<Router>,
 ) -> std::io::Result<()> {
-    let read_limit = Duration::from_secs(config.read_timeout_secs);
+    let first_request_wait = Duration::from_secs(config.read_timeout_secs);
+    let idle_wait = Duration::from_secs(config.keep_alive_timeout_secs);
     let write_timeout = Duration::from_secs(config.write_timeout_secs);
 
+    // Bytes read from the client but not yet used. It can hold the start of
+    // the next request while we answer the current one.
     let mut buffer: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 1024];
+    let mut served: usize = 0;
 
-    // Step 1: read until we have all the headers, before the deadline.
-    let header_deadline = Instant::now() + read_limit;
-    let (mut request, consumed) = loop {
-        match read_with_deadline(&mut stream, &mut chunk, header_deadline).await? {
-            ReadOutcome::Data(n) => buffer.extend_from_slice(&chunk[..n]),
-            ReadOutcome::Closed => {
-                debug!("client closed the connection before sending a full request");
+    loop {
+        // A brand-new connection gets the normal read limit to speak up.
+        // After that, we only wait the (shorter) idle time for the next request.
+        let wait = if served == 0 { first_request_wait } else { idle_wait };
+
+        let request = match read_request(&mut stream, &mut buffer, &config, wait).await? {
+            Incoming::Request(request) => request,
+            Incoming::Finished => {
+                debug!("connection finished after {served} request(s)");
                 return Ok(());
             }
-            ReadOutcome::TimedOut => {
-                if buffer.is_empty() {
-                    // Connected but never said anything: just hang up.
-                    debug!("closing a connection that sent nothing");
-                    return Ok(());
-                }
+            // After an error we no longer trust where the next request
+            // would start, so we always close.
+            Incoming::Failed(Failure::Parse(e)) => {
+                return reject(&mut stream, e, write_timeout).await;
+            }
+            Incoming::Failed(Failure::TimedOut) => {
                 return request_timeout(&mut stream, write_timeout).await;
             }
-        }
+        };
+        served += 1;
 
-        match parse_request(&buffer, config.max_header_bytes) {
-            Ok(ParseResult::Complete { request, consumed }) => break (request, consumed),
-            Ok(ParseResult::Incomplete) => continue,
-            Err(e) => {
-                reject(&mut stream, e, write_timeout).await?;
-                return Ok(());
-            }
-        }
-    };
+        // Decide who answers. A registered route wins. Otherwise GET and
+        // HEAD requests look for a file in the document root.
+        let mut response = if router.knows_path(&request) {
+            router.handle(&request)
+        } else if matches!(request.method, Method::Get | Method::Head) {
+            static_files::serve(&config.document_root, &request).await
+        } else {
+            router.handle(&request)
+        };
 
-    // Step 2: decide whether there is a body, and how it is delimited.
-    let framing = match body_framing(&request, config.max_body_bytes) {
-        Ok(framing) => framing,
-        Err(e) => {
-            reject(&mut stream, e, write_timeout).await?;
+        let keep_open = client_allows_keep_alive(&request)
+            && served < config.max_requests_per_connection;
+        response.keep_alive = keep_open;
+
+        info!(
+            "{} {} -> {}",
+            request.method.as_str(),
+            request.target,
+            response.status
+        );
+
+        let include_body = request.method != Method::Head;
+        let sent_cleanly = send(&mut stream, response, include_body, write_timeout).await?;
+        if !keep_open || !sent_cleanly {
             return Ok(());
         }
-    };
-
-    // Step 3: read the body, with its own deadline.
-    match framing {
-        BodyFraming::None => {}
-
-        BodyFraming::ContentLength(length) => {
-            let body_deadline = Instant::now() + read_limit;
-            let mut body = buffer[consumed..].to_vec();
-            while body.len() < length {
-                match read_with_deadline(&mut stream, &mut chunk, body_deadline).await? {
-                    ReadOutcome::Data(n) => body.extend_from_slice(&chunk[..n]),
-                    ReadOutcome::Closed => {
-                        debug!("client closed the connection before sending the full body");
-                        return Ok(());
-                    }
-                    ReadOutcome::TimedOut => {
-                        return request_timeout(&mut stream, write_timeout).await;
-                    }
-                }
-            }
-            body.truncate(length);
-            request.body = body;
-        }
-
-        BodyFraming::Chunked => {
-            let body_deadline = Instant::now() + read_limit;
-            buffer.drain(..consumed);
-            let mut body: Vec<u8> = Vec::new();
-            let mut pos = 0;
-
-            loop {
-                match decode_chunked(&buffer, &mut pos, &mut body, config.max_body_bytes) {
-                    Ok(true) => break,
-                    Ok(false) => {}
-                    Err(e) => {
-                        reject(&mut stream, e, write_timeout).await?;
-                        return Ok(());
-                    }
-                }
-
-                buffer.drain(..pos);
-                pos = 0;
-
-                match read_with_deadline(&mut stream, &mut chunk, body_deadline).await? {
-                    ReadOutcome::Data(n) => buffer.extend_from_slice(&chunk[..n]),
-                    ReadOutcome::Closed => {
-                        debug!("client closed the connection in the middle of a chunked body");
-                        return Ok(());
-                    }
-                    ReadOutcome::TimedOut => {
-                        return request_timeout(&mut stream, write_timeout).await;
-                    }
-                }
-            }
-            request.body = body;
-        }
     }
-
-    // Step 4: decide who answers. A registered route wins. Otherwise GET and
-    // HEAD requests look for a file in the document root.
-    let response = if router.knows_path(&request) {
-        router.handle(&request)
-    } else if matches!(request.method, Method::Get | Method::Head) {
-        static_files::serve(&config.document_root, &request).await
-    } else {
-        router.handle(&request)
-    };
-
-    info!(
-        "{} {} -> {}",
-        request.method.as_str(),
-        request.target,
-        response.status
-    );
-
-    let include_body = request.method != Method::Head;
-    send(&mut stream, response, include_body, write_timeout).await
 }
 
 /// The client was too slow sending its request.
 async fn request_timeout(stream: &mut TcpStream, write_timeout: Duration) -> std::io::Result<()> {
     warn!("timed out waiting for the client to finish its request");
     let response = Response::text(408, "408 Request Timeout\n");
-    send(stream, response, true, write_timeout).await
+    send(stream, response, true, write_timeout).await?;
+    Ok(())
 }
 
-/// Write a response to the client. Small bodies go out in one write. File
-/// slices are streamed from disk in small pieces, so memory use stays tiny
-/// whatever the file size. Every write has a time limit, so a client that
-/// stops reading cannot hold the connection forever.
+/// Write a response to the client. Returns `true` if the connection may be
+/// used again, or `false` if it must be closed.
+///
+/// Small bodies go out in one write. File slices are streamed from disk in
+/// small pieces, so memory use stays tiny whatever the file size. Every
+/// write has a time limit, so a client that stops reading cannot hold the
+/// connection forever.
 async fn send(
     stream: &mut TcpStream,
     response: Response,
     include_body: bool,
     write_timeout: Duration,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     match &response.file {
         None => {
             write_all_timeout(stream, &response.to_bytes(include_body), write_timeout).await?;
@@ -288,10 +236,13 @@ async fn send(
                 Ok(file) => file,
                 Err(e) => {
                     warn!("could not open {}: {e}", slice.path.display());
+                    // This error response says "Connection: close", so the
+                    // connection must really close afterwards.
                     let failure = Response::text(500, "500 Internal Server Error\n");
                     write_all_timeout(stream, &failure.to_bytes(include_body), write_timeout)
                         .await?;
-                    return stream.flush().await;
+                    stream.flush().await?;
+                    return Ok(false);
                 }
             };
 
@@ -317,7 +268,8 @@ async fn send(
             }
         }
     }
-    stream.flush().await
+    stream.flush().await?;
+    Ok(true)
 }
 
 /// Open a file and jump to where the slice starts.
@@ -341,5 +293,6 @@ async fn reject(
         true,
         write_timeout,
     )
-    .await
+    .await?;
+    Ok(())
 }

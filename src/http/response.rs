@@ -22,6 +22,8 @@ pub struct Response {
     pub body: Vec<u8>,
     /// A file slice to stream. When set, it is the body and `body` is unused.
     pub file: Option<FileSlice>,
+    /// Tell the client the connection stays open for another request.
+    pub keep_alive: bool,
 }
 
 impl Response {
@@ -32,6 +34,7 @@ impl Response {
             headers: Vec::new(),
             body: Vec::new(),
             file: None,
+            keep_alive: false,
         }
     }
 
@@ -116,7 +119,11 @@ impl Response {
         if !self.status_has_no_body() {
             head.push_str(&format!("Content-Length: {}\r\n", self.content_length()));
         }
-        head.push_str("Connection: close\r\n\r\n");
+        if self.keep_alive {
+            head.push_str("Connection: keep-alive\r\n\r\n");
+        } else {
+            head.push_str("Connection: close\r\n\r\n");
+        }
 
         head.into_bytes()
     }
@@ -227,5 +234,21 @@ mod tests {
         let text = as_text(Response::new(204).to_bytes(true));
         assert!(!text.contains("Content-Length"));
         assert!(text.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn responses_close_the_connection_by_default() {
+        let text = as_text(Response::text(200, "hi").to_bytes(true));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(!text.contains("keep-alive"));
+    }
+
+    #[test]
+    fn keep_alive_responses_say_so() {
+        let mut response = Response::text(200, "hi");
+        response.keep_alive = true;
+        let text = as_text(response.to_bytes(true));
+        assert!(text.contains("Connection: keep-alive\r\n"));
+        assert!(!text.contains("Connection: close"));
     }
 }

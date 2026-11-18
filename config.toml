@@ -13,3 +13,10 @@ write_timeout_secs = 30
 
 # Most connections handled at once. Extra ones get "503 Service Unavailable".
 max_connections = 1000
+
+# How long an idle connection may wait for its next request.
+keep_alive_timeout_secs = 5
+
+# Most requests served on one connection before we close it.
+# Set to 1 to turn keep-alive off.
+max_requests_per_connection = 100
