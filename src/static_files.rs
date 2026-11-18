@@ -1,6 +1,7 @@
 use crate::http::request::Request;
 use crate::http::response::Response;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
 
 /// Largest file we will serve for now. Streaming big files comes in Step 4c.
@@ -104,13 +105,22 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// The opposite of decoding: keep letters, digits and "-_.~", escape the rest.
+fn percent_encode(segment: &str) -> String {
+    let mut out = String::new();
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 /// Does the path part of the target end with a slash, like "/docs/"?
 fn ends_with_slash(target: &str) -> bool {
-    target
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("")
-        .ends_with('/')
+    target.split(['?', '#']).next().unwrap_or("").ends_with('/')
 }
 
 /// Ask the operating system for the file's real location (following any
@@ -138,6 +148,85 @@ fn content_type_for(path: &Path) -> String {
     }
 }
 
+/// Redirect "/docs" to "/docs/". The Location is rebuilt from the cleaned-up
+/// path (never copied from the request), so it can only ever point to a
+/// path on this same server.
+fn redirect_to_folder(relative: &Path, target: &str) -> Response {
+    let mut location = String::from("/");
+    for component in relative.components() {
+        location.push_str(&percent_encode(&component.as_os_str().to_string_lossy()));
+        location.push('/');
+    }
+    // Keep the query string, so "/docs?page=2" becomes "/docs/?page=2".
+    if let Some((_, rest)) = target.split_once('?') {
+        let query = rest.split('#').next().unwrap_or("");
+        location.push('?');
+        location.push_str(query);
+    }
+
+    Response::new(301)
+        .header("Location", &location)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body("301 Moved Permanently\n")
+}
+
+/// A file's fingerprint, used to answer "has it changed?".
+struct Validators {
+    /// Like "\"1a2-17f3b...\"" (size and modification time, in hex).
+    etag: String,
+    /// Like "Wed, 18 Nov 2026 08:30:00 GMT".
+    last_modified: String,
+    /// The modification time in whole seconds (HTTP dates have no fractions).
+    modified_secs: u64,
+}
+
+fn file_validators(metadata: &std::fs::Metadata) -> Option<Validators> {
+    let modified = metadata.modified().ok()?;
+    let since_epoch = modified.duration_since(UNIX_EPOCH).ok()?;
+    let modified_secs = since_epoch.as_secs();
+
+    Some(Validators {
+        etag: format!("\"{:x}-{:x}\"", metadata.len(), since_epoch.as_nanos()),
+        last_modified: httpdate::fmt_http_date(UNIX_EPOCH + Duration::from_secs(modified_secs)),
+        modified_secs,
+    })
+}
+
+fn with_validators(response: Response, validators: &Validators) -> Response {
+    response
+        .header("ETag", &validators.etag)
+        .header("Last-Modified", &validators.last_modified)
+}
+
+/// Does an If-None-Match header value match our ETag?
+/// The value can be "*", one tag, or a comma-separated list. A "W/" prefix
+/// marks a "weak" tag, which is fine to compare for caching.
+fn etag_matches(header_value: &str, etag: &str) -> bool {
+    header_value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+/// Should we answer "304 Not Modified" instead of sending the file?
+fn is_not_modified(request: &Request, validators: &Validators) -> bool {
+    // If-None-Match is more precise, so when it is present it alone decides
+    // and If-Modified-Since is ignored.
+    if let Some(value) = request.header("if-none-match") {
+        return etag_matches(value, &validators.etag);
+    }
+
+    if let Some(value) = request.header("if-modified-since") {
+        // A date we cannot understand is simply ignored.
+        if let Ok(since) = httpdate::parse_http_date(value) {
+            if let Ok(since) = since.duration_since(UNIX_EPOCH) {
+                return validators.modified_secs <= since.as_secs();
+            }
+        }
+    }
+
+    false
+}
+
 /// Serve a file from `document_root` for a GET or HEAD request.
 pub async fn serve(document_root: &str, request: &Request) -> Response {
     let Some(relative) = safe_relative_path(&request.target) else {
@@ -160,10 +249,10 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
         return not_found();
     };
 
-    // A folder: serve its index.html, but only for URLs ending in "/".
+    // A folder: redirect "/docs" to "/docs/", then serve its index.html.
     if metadata.is_dir() {
         if !ends_with_slash(&request.target) {
-            return not_found();
+            return redirect_to_folder(&relative, &request.target);
         }
         let Some(index) = resolve_inside(&root, &path.join("index.html")).await else {
             return not_found();
@@ -184,11 +273,26 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
         return Response::text(500, "500 Internal Server Error\n");
     }
 
+    // Check "has it changed?" BEFORE reading the file, so a 304 costs almost nothing.
+    let validators = file_validators(&metadata);
+    if let Some(v) = &validators {
+        if is_not_modified(request, v) {
+            return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
+        }
+    }
+
     match tokio::fs::read(&path).await {
-        Ok(bytes) => Response::new(200)
-            .header("Content-Type", &content_type_for(&path))
-            .header("X-Content-Type-Options", "nosniff")
-            .body(bytes),
+        Ok(bytes) => {
+            let mut response = Response::new(200)
+                .header("Content-Type", &content_type_for(&path))
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Cache-Control", "no-cache")
+                .body(bytes);
+            if let Some(v) = &validators {
+                response = with_validators(response, v);
+            }
+            response
+        }
         Err(e) => {
             warn!("could not read {}: {e}", path.display());
             Response::text(500, "500 Internal Server Error\n")
@@ -247,7 +351,10 @@ mod tests {
 
     #[test]
     fn repeated_slashes_collapse() {
-        assert_eq!(safe_relative_path("//a///b"), Some(PathBuf::from("a").join("b")));
+        assert_eq!(
+            safe_relative_path("//a///b"),
+            Some(PathBuf::from("a").join("b"))
+        );
     }
 
     #[test]
@@ -327,8 +434,8 @@ mod tests {
 
     impl TempSite {
         fn new(name: &str) -> TempSite {
-            let root = std::env::temp_dir()
-                .join(format!("webserver-test-{}-{name}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("webserver-test-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("docs")).unwrap();
             std::fs::write(root.join("index.html"), "<h1>home</h1>").unwrap();
@@ -382,7 +489,10 @@ mod tests {
 
         let css = serve(site.path(), &get("/style.css")).await;
         assert_eq!(css.status, 200);
-        assert_eq!(content_type(&css).as_deref(), Some("text/css; charset=utf-8"));
+        assert_eq!(
+            content_type(&css).as_deref(),
+            Some("text/css; charset=utf-8")
+        );
 
         let html = serve(site.path(), &get("/index.html")).await;
         assert_eq!(
@@ -404,7 +514,11 @@ mod tests {
         assert_eq!(with_slash.body, b"<h1>docs</h1>");
 
         let without_slash = serve(site.path(), &get("/docs")).await;
-        assert_eq!(without_slash.status, 404);
+        assert_eq!(without_slash.status, 301);
+        assert_eq!(
+            header_of(&without_slash, "Location").as_deref(),
+            Some("/docs/")
+        );
     }
 
     #[tokio::test]
@@ -441,9 +555,177 @@ mod tests {
     async fn file_responses_include_nosniff() {
         let site = TempSite::new("nosniff");
         let response = serve(site.path(), &get("/style.css")).await;
-        assert!(response
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "X-Content-Type-Options" && value == "nosniff")
+        );
+    }
+
+    // ---------- redirects and conditional requests ----------
+
+    fn header_of(response: &Response, name: &str) -> Option<String> {
+        response
             .headers
             .iter()
-            .any(|(name, value)| name == "X-Content-Type-Options" && value == "nosniff"));
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    fn get_with(target: &str, headers: &[(&str, &str)]) -> Request {
+        let mut request = get(target);
+        for (name, value) in headers {
+            request.headers.push((name.to_string(), value.to_string()));
+        }
+        request
+    }
+
+    #[test]
+    fn etag_matching_rules() {
+        assert!(etag_matches("\"abc\"", "\"abc\""));
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("\"x\", \"abc\", \"y\"", "\"abc\""));
+        assert!(etag_matches("*", "\"abc\""));
+        assert!(!etag_matches("\"other\"", "\"abc\""));
+        assert!(!etag_matches("", "\"abc\""));
+    }
+
+    #[test]
+    fn percent_encoding_escapes_unsafe_characters() {
+        assert_eq!(percent_encode("docs"), "docs");
+        assert_eq!(percent_encode("my docs"), "my%20docs");
+        assert_eq!(percent_encode("a/b"), "a%2Fb");
+    }
+
+    #[tokio::test]
+    async fn redirect_keeps_the_query_string() {
+        let site = TempSite::new("redirect-query");
+        let response = serve(site.path(), &get("/docs?page=2")).await;
+        assert_eq!(response.status, 301);
+        assert_eq!(
+            header_of(&response, "Location").as_deref(),
+            Some("/docs/?page=2")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirects_never_point_to_another_site() {
+        let site = TempSite::new("redirect-safe");
+        for target in ["//docs", "///docs", "/./docs", "//docs?x=1"] {
+            let response = serve(site.path(), &get(target)).await;
+            if response.status == 301 {
+                let location = header_of(&response, "Location").unwrap();
+                assert!(location.starts_with('/'));
+                assert!(!location.starts_with("//"), "bad redirect for {target}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn files_come_with_validators() {
+        let site = TempSite::new("validators");
+        let response = serve(site.path(), &get("/style.css")).await;
+        assert_eq!(response.status, 200);
+
+        let etag = header_of(&response, "ETag").unwrap();
+        assert!(etag.starts_with('"') && etag.ends_with('"'));
+        assert!(
+            header_of(&response, "Last-Modified")
+                .unwrap()
+                .ends_with(" GMT")
+        );
+        assert_eq!(
+            header_of(&response, "Cache-Control").as_deref(),
+            Some("no-cache")
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_etag_gets_304_without_a_body() {
+        let site = TempSite::new("etag-304");
+        let first = serve(site.path(), &get("/style.css")).await;
+        let etag = header_of(&first, "ETag").unwrap();
+
+        let request = get_with("/style.css", &[("If-None-Match", etag.as_str())]);
+        let second = serve(site.path(), &request).await;
+        assert_eq!(second.status, 304);
+        assert!(second.body.is_empty());
+        assert_eq!(header_of(&second, "ETag"), Some(etag));
+    }
+
+    #[tokio::test]
+    async fn weak_and_wildcard_etags_also_match() {
+        let site = TempSite::new("etag-weak");
+        let first = serve(site.path(), &get("/style.css")).await;
+        let etag = header_of(&first, "ETag").unwrap();
+        let weak = format!("W/{etag}");
+
+        for value in [weak.as_str(), "*"] {
+            let request = get_with("/style.css", &[("If-None-Match", value)]);
+            assert_eq!(serve(site.path(), &request).await.status, 304);
+        }
+    }
+
+    #[tokio::test]
+    async fn different_etag_gets_the_full_file() {
+        let site = TempSite::new("etag-200");
+        let request = get_with("/style.css", &[("If-None-Match", "\"something-else\"")]);
+        let response = serve(site.path(), &request).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"body {}");
+    }
+
+    #[tokio::test]
+    async fn etag_changes_when_the_file_changes() {
+        let site = TempSite::new("etag-change");
+        let before = serve(site.path(), &get("/style.css")).await;
+
+        std::fs::write(site.root.join("style.css"), "body { color: red }").unwrap();
+
+        let after = serve(site.path(), &get("/style.css")).await;
+        assert_ne!(header_of(&before, "ETag"), header_of(&after, "ETag"));
+    }
+
+    #[tokio::test]
+    async fn if_modified_since_in_the_future_gets_304() {
+        let site = TempSite::new("since-future");
+        let request = get_with(
+            "/style.css",
+            &[("If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT")],
+        );
+        let response = serve(site.path(), &request).await;
+        assert_eq!(response.status, 304);
+        assert!(response.body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn if_modified_since_in_the_past_gets_the_file() {
+        let site = TempSite::new("since-past");
+        let request = get_with(
+            "/style.css",
+            &[("If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT")],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn garbage_dates_are_ignored() {
+        let site = TempSite::new("since-garbage");
+        let request = get_with("/style.css", &[("If-Modified-Since", "not a date")]);
+        assert_eq!(serve(site.path(), &request).await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn if_none_match_beats_if_modified_since() {
+        let site = TempSite::new("precedence");
+        let request = get_with(
+            "/style.css",
+            &[
+                ("If-None-Match", "\"something-else\""),
+                ("If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT"),
+            ],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 200);
     }
 }

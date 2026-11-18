@@ -55,10 +55,13 @@ impl Response {
             .body(body)
     }
 
-    /// Turn the response into the exact bytes sent over the network.
+     /// Turn the response into the exact bytes sent over the network.
     /// For HEAD requests pass `include_body = false`: the headers (including
     /// Content-Length) stay the same, but the body is left out.
     pub fn to_bytes(&self, include_body: bool) -> Vec<u8> {
+        // These statuses never have a body, so they get no Content-Length either.
+        let status_has_no_body = self.status == 204 || self.status == 304;
+
         let mut head = format!(
             "HTTP/1.1 {} {}\r\n",
             self.status,
@@ -79,15 +82,18 @@ impl Response {
             httpdate::fmt_http_date(SystemTime::now())
         ));
         head.push_str("Server: webserver/0.1\r\n");
-        head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        if !status_has_no_body {
+            head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
         head.push_str("Connection: close\r\n\r\n");
 
         let mut bytes = head.into_bytes();
-        if include_body {
+        if include_body && !status_has_no_body {
             bytes.extend_from_slice(&self.body);
         }
         bytes
     }
+
 }
 
 /// Header names may only contain letters, digits and '-' here.
@@ -166,4 +172,23 @@ mod tests {
         let html = as_text(Response::html(200, "<p>hi</p>").to_bytes(true));
         assert!(html.contains("Content-Type: text/html; charset=utf-8\r\n"));
     }
+
+        #[test]
+    fn not_modified_has_no_body_and_no_content_length() {
+        let response = Response::new(304).header("ETag", "\"abc\"").body("ignored");
+        let text = as_text(response.to_bytes(true));
+        assert!(text.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+        assert!(text.contains("ETag: \"abc\"\r\n"));
+        assert!(!text.contains("Content-Length"));
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(!text.contains("ignored"));
+    }
+
+    #[test]
+    fn no_content_has_no_body_and_no_content_length() {
+        let text = as_text(Response::new(204).to_bytes(true));
+        assert!(!text.contains("Content-Length"));
+        assert!(text.ends_with("\r\n\r\n"));
+    }
+    
 }
