@@ -1,12 +1,15 @@
 mod config;
+mod handlers;
 mod http;
+mod router;
 
 use clap::Parser;
 use config::Config;
 use http::chunked::decode_chunked;
-use http::parser::{body_framing, parse_request, BodyFraming, ParseError, ParseResult};
+use http::parser::{BodyFraming, ParseError, ParseResult, body_framing, parse_request};
 use http::request::Method;
 use http::response::Response;
+use router::Router;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -23,6 +26,16 @@ struct Args {
     /// Override the port from the config file
     #[arg(long)]
     port: Option<u16>,
+}
+
+/// The list of pages this server offers.
+fn build_router() -> Router {
+    Router::default()
+        .add(Method::Get, "/", handlers::index)
+        .add(Method::Get, "/health", handlers::health)
+        .add(Method::Get, "/about", handlers::about)
+        .add(Method::Get, "/echo", handlers::echo)
+        .add(Method::Post, "/echo", handlers::echo)
 }
 
 #[tokio::main]
@@ -54,6 +67,7 @@ async fn main() -> std::io::Result<()> {
 
     let address = config.address();
     let config = Arc::new(config);
+    let router = Arc::new(build_router());
 
     let listener = TcpListener::bind(&address).await?;
     info!("Listening on http://{address}");
@@ -63,15 +77,20 @@ async fn main() -> std::io::Result<()> {
         debug!("New connection from {addr}");
 
         let config = Arc::clone(&config);
+        let router = Arc::clone(&router);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, config).await {
+            if let Err(e) = handle_connection(stream, config, router).await {
                 error!("Connection error: {e}");
             }
         });
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
+async fn handle_connection(
+    mut stream: TcpStream,
+    config: Arc<Config>,
+    router: Arc<Router>,
+) -> std::io::Result<()> {
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
 
@@ -150,28 +169,15 @@ async fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::i
         }
     }
 
+    // Step 4: let the router pick a handler and build the response.
+    let response = router.handle(&request);
     info!(
-        "{:?} {} (body: {} bytes)",
-        request.method,
+        "{} {} -> {}",
+        request.method.as_str(),
         request.target,
-        request.body.len()
+        response.status
     );
 
-    // For now, echo back what we understood.
-    let mut text = format!(
-        "Method: {:?}\nPath: {}\nVersion: {:?}\n\nHeaders:\n",
-        request.method, request.target, request.version
-    );
-    for (name, value) in &request.headers {
-        text.push_str(&format!("  {name}: {value}\n"));
-    }
-    text.push_str(&format!(
-        "\nBody ({} bytes):\n{}\n",
-        request.body.len(),
-        String::from_utf8_lossy(&request.body)
-    ));
-
-    let response = Response::text(200, text);
     let include_body = request.method != Method::Head;
     send(&mut stream, response, include_body).await
 }

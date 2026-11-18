@@ -24,6 +24,20 @@ impl Method {
             other => Method::Other(other.to_string()),
         }
     }
+
+    /// The method as it appears on the wire, like "GET".
+    pub fn as_str(&self) -> &str {
+        match self {
+            Method::Get => "GET",
+            Method::Head => "HEAD",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Delete => "DELETE",
+            Method::Options => "OPTIONS",
+            Method::Patch => "PATCH",
+            Method::Other(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
