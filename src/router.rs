@@ -27,6 +27,12 @@ impl Router {
         self
     }
 
+    /// True if any route has this path, whatever the method.
+    pub fn knows_path(&self, request: &Request) -> bool {
+        let path = path_only(&request.target);
+        self.routes.iter().any(|route| route.path == path)
+    }
+
     /// Find the right handler, or build a 404 / 405 response.
     pub fn handle(&self, request: &Request) -> Response {
         let path = path_only(&request.target);
@@ -164,5 +170,17 @@ mod tests {
         let router = Router::default().add(Method::Post, "/submit", created);
         let response = router.handle(&request(Method::Head, "/submit"));
         assert_eq!(response.status, 405);
+    }
+
+    #[test]
+    fn knows_registered_paths() {
+        assert!(router().knows_path(&request(Method::Get, "/health")));
+        assert!(router().knows_path(&request(Method::Delete, "/health?x=1")));
+    }
+
+    #[test]
+    fn does_not_know_other_paths() {
+        assert!(!router().knows_path(&request(Method::Get, "/style.css")));
+        assert!(!router().knows_path(&request(Method::Get, "/")));
     }
 }

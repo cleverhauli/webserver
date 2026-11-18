@@ -1,27 +1,6 @@
 use crate::http::request::Request;
 use crate::http::response::Response;
 
-/// The home page.
-pub fn index(_request: &Request) -> Response {
-    Response::html(
-        200,
-        r#"<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>My Rust Web Server</title></head>
-<body>
-  <h1>It works!</h1>
-  <p>This page is served by a web server written from scratch in Rust.</p>
-  <ul>
-    <li><a href="/health">/health</a></li>
-    <li><a href="/about">/about</a></li>
-    <li><a href="/echo">/echo</a></li>
-  </ul>
-</body>
-</html>
-"#,
-    )
-}
-
 /// Used by monitoring tools to check the server is alive.
 pub fn health(_request: &Request) -> Response {
     Response::json(200, r#"{"status":"ok"}"#)

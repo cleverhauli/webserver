@@ -2,11 +2,12 @@ mod config;
 mod handlers;
 mod http;
 mod router;
+mod static_files;
 
 use clap::Parser;
 use config::Config;
 use http::chunked::decode_chunked;
-use http::parser::{BodyFraming, ParseError, ParseResult, body_framing, parse_request};
+use http::parser::{body_framing, parse_request, BodyFraming, ParseError, ParseResult};
 use http::request::Method;
 use http::response::Response;
 use router::Router;
@@ -28,10 +29,10 @@ struct Args {
     port: Option<u16>,
 }
 
-/// The list of pages this server offers.
+/// The special pages this server offers. Everything else is looked up as a
+/// file in the document root.
 fn build_router() -> Router {
     Router::default()
-        .add(Method::Get, "/", handlers::index)
         .add(Method::Get, "/health", handlers::health)
         .add(Method::Get, "/about", handlers::about)
         .add(Method::Get, "/echo", handlers::echo)
@@ -66,6 +67,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let address = config.address();
+    info!("Serving files from '{}'", config.document_root);
     let config = Arc::new(config);
     let router = Arc::new(build_router());
 
@@ -169,8 +171,16 @@ async fn handle_connection(
         }
     }
 
-    // Step 4: let the router pick a handler and build the response.
-    let response = router.handle(&request);
+    // Step 4: decide who answers. A registered route wins. Otherwise GET and
+    // HEAD requests look for a file in the document root.
+    let response = if router.knows_path(&request) {
+        router.handle(&request)
+    } else if matches!(request.method, Method::Get | Method::Head) {
+        static_files::serve(&config.document_root, &request).await
+    } else {
+        router.handle(&request)
+    };
+
     info!(
         "{} {} -> {}",
         request.method.as_str(),
