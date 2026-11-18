@@ -4,9 +4,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
 
-/// Largest file we will serve for now. Streaming big files comes in Step 4c.
-const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
-
 /// Turn the path part of a request target into a SAFE relative path,
 /// or `None` if anything about it looks suspicious.
 ///
@@ -227,6 +224,112 @@ fn is_not_modified(request: &Request, validators: &Validators) -> bool {
     false
 }
 
+/// Files up to this size are sent from memory in one go. Bigger files are streamed.
+const SMALL_FILE_BYTES: u64 = 64 * 1024;
+
+/// What a Range header asks for.
+#[derive(Debug, PartialEq)]
+enum RangeOutcome {
+    /// No usable Range header: send the whole file.
+    Full,
+    /// Send bytes `start` to `end`, both inclusive and already inside the file.
+    Partial { start: u64, end: u64 },
+    /// The range lies outside the file: answer 416.
+    Unsatisfiable,
+}
+
+/// Digits only. A number too big for u64 becomes "as big as possible",
+/// so huge values can never crash anything.
+fn parse_number(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(text.parse().unwrap_or(u64::MAX))
+}
+
+/// Understand a Range header for a file of `size` bytes.
+/// Anything unusual is ignored (`Full`), which HTTP allows.
+fn parse_range(header: &str, size: u64) -> RangeOutcome {
+    let Some((unit, spec)) = header.trim().split_once('=') else {
+        return RangeOutcome::Full;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return RangeOutcome::Full;
+    }
+    let spec = spec.trim();
+
+    // Several ranges at once ("0-5,10-15") are not supported.
+    if spec.contains(',') {
+        return RangeOutcome::Full;
+    }
+    let Some((first, last)) = spec.split_once('-') else {
+        return RangeOutcome::Full;
+    };
+
+    // "-500" means the LAST 500 bytes.
+    if first.is_empty() {
+        let Some(suffix) = parse_number(last) else {
+            return RangeOutcome::Full;
+        };
+        if suffix == 0 || size == 0 {
+            return RangeOutcome::Unsatisfiable;
+        }
+        return RangeOutcome::Partial {
+            start: size.saturating_sub(suffix),
+            end: size - 1,
+        };
+    }
+
+    let Some(start) = parse_number(first) else {
+        return RangeOutcome::Full;
+    };
+    let end = if last.is_empty() {
+        None
+    } else {
+        match parse_number(last) {
+            Some(end) => Some(end),
+            None => return RangeOutcome::Full,
+        }
+    };
+
+    // "5-3" is nonsense, so ignore it.
+    if let Some(end) = end {
+        if end < start {
+            return RangeOutcome::Full;
+        }
+    }
+    if start >= size {
+        return RangeOutcome::Unsatisfiable;
+    }
+
+    RangeOutcome::Partial {
+        start,
+        end: end.map_or(size - 1, |end| end.min(size - 1)),
+    }
+}
+
+/// If-Range means "only give me a part if the file is still exactly the
+/// version I have". Returns true when the Range header may be used.
+fn if_range_allows(request: &Request, validators: &Validators) -> bool {
+    let Some(value) = request.header("if-range") else {
+        return true;
+    };
+    let value = value.trim();
+
+    // An ETag. Weak tags ("W/...") never qualify here.
+    if value.starts_with('"') {
+        return value == validators.etag;
+    }
+
+    // Otherwise it must be the exact modification date.
+    match httpdate::parse_http_date(value) {
+        Ok(date) => date
+            .duration_since(UNIX_EPOCH)
+            .map_or(false, |d| d.as_secs() == validators.modified_secs),
+        Err(_) => false,
+    }
+}
+
 /// Serve a file from `document_root` for a GET or HEAD request.
 pub async fn serve(document_root: &str, request: &Request) -> Response {
     let Some(relative) = safe_relative_path(&request.target) else {
@@ -268,35 +371,56 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
         return not_found();
     }
 
-    if metadata.len() > MAX_FILE_BYTES {
-        warn!("file too large to serve yet: {}", path.display());
-        return Response::text(500, "500 Internal Server Error\n");
-    }
-
-    // Check "has it changed?" BEFORE reading the file, so a 304 costs almost nothing.
+    let size = metadata.len();
     let validators = file_validators(&metadata);
+
+    // "Has it changed?" comes first, so a 304 costs almost nothing.
     if let Some(v) = &validators {
         if is_not_modified(request, v) {
             return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
         }
     }
 
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let mut response = Response::new(200)
-                .header("Content-Type", &content_type_for(&path))
-                .header("X-Content-Type-Options", "nosniff")
-                .header("Cache-Control", "no-cache")
-                .body(bytes);
-            if let Some(v) = &validators {
-                response = with_validators(response, v);
+    // Does the client want only part of the file?
+    let range_allowed = match &validators {
+        Some(v) => if_range_allows(request, v),
+        None => request.header("if-range").is_none(),
+    };
+    let outcome = match request.header("range") {
+        Some(value) if range_allowed => parse_range(value, size),
+        _ => RangeOutcome::Full,
+    };
+
+    let content_type = content_type_for(&path);
+    let base = |status: u16| {
+        let mut response = Response::new(status)
+            .header("Content-Type", &content_type)
+            .header("X-Content-Type-Options", "nosniff")
+            .header("Cache-Control", "no-cache")
+            .header("Accept-Ranges", "bytes");
+        if let Some(v) = &validators {
+            response = with_validators(response, v);
+        }
+        response
+    };
+
+    match outcome {
+        RangeOutcome::Unsatisfiable => Response::text(416, "416 Range Not Satisfiable\n")
+            .header("Content-Range", &format!("bytes */{size}")),
+
+        RangeOutcome::Partial { start, end } => base(206)
+            .header("Content-Range", &format!("bytes {start}-{end}/{size}"))
+            .with_file(path, start, end - start + 1),
+
+        RangeOutcome::Full if size <= SMALL_FILE_BYTES => match tokio::fs::read(&path).await {
+            Ok(bytes) => base(200).body(bytes),
+            Err(e) => {
+                warn!("could not read {}: {e}", path.display());
+                Response::text(500, "500 Internal Server Error\n")
             }
-            response
-        }
-        Err(e) => {
-            warn!("could not read {}: {e}", path.display());
-            Response::text(500, "500 Internal Server Error\n")
-        }
+        },
+
+        RangeOutcome::Full => base(200).with_file(path, 0, size),
     }
 }
 
@@ -442,6 +566,7 @@ mod tests {
             std::fs::write(root.join("docs").join("index.html"), "<h1>docs</h1>").unwrap();
             std::fs::write(root.join("style.css"), "body {}").unwrap();
             std::fs::write(root.join("data.bin"), [1u8, 2, 3]).unwrap();
+            std::fs::write(root.join("digits.txt"), "0123456789").unwrap();
             std::fs::write(root.join(".secret"), "hidden").unwrap();
             TempSite { root }
         }
@@ -727,5 +852,244 @@ mod tests {
             ],
         );
         assert_eq!(serve(site.path(), &request).await.status, 200);
+    }
+
+    // ---------- streaming and Range requests ----------
+
+    /// The bytes a client would receive as the body, wherever they come from.
+    async fn full_body(response: &Response) -> Vec<u8> {
+        match &response.file {
+            Some(slice) => {
+                let bytes = tokio::fs::read(&slice.path).await.unwrap();
+                let start = slice.start as usize;
+                bytes[start..start + slice.len as usize].to_vec()
+            }
+            None => response.body.clone(),
+        }
+    }
+
+    fn with_range(target: &str, range: &str) -> Request {
+        get_with(target, &[("Range", range)])
+    }
+
+    #[test]
+    fn valid_ranges_are_understood() {
+        use RangeOutcome::*;
+        assert_eq!(parse_range("bytes=0-3", 10), Partial { start: 0, end: 3 });
+        assert_eq!(parse_range("bytes=2-", 10), Partial { start: 2, end: 9 });
+        assert_eq!(parse_range("bytes=-4", 10), Partial { start: 6, end: 9 });
+        assert_eq!(parse_range("bytes=5-500", 10), Partial { start: 5, end: 9 });
+        assert_eq!(parse_range("bytes=-500", 10), Partial { start: 0, end: 9 });
+        assert_eq!(parse_range("BYTES=0-0", 10), Partial { start: 0, end: 0 });
+        assert_eq!(parse_range("  bytes=1-2  ", 10), Partial { start: 1, end: 2 });
+        assert_eq!(
+            parse_range("bytes=5-99999999999999999999999", 10),
+            Partial { start: 5, end: 9 }
+        );
+        assert_eq!(
+            parse_range("bytes=-99999999999999999999999", 10),
+            Partial { start: 0, end: 9 }
+        );
+    }
+
+    #[test]
+    fn out_of_file_ranges_are_unsatisfiable() {
+        use RangeOutcome::*;
+        assert_eq!(parse_range("bytes=10-", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=10-20", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-0", 10), Unsatisfiable);
+        assert_eq!(parse_range("bytes=0-", 0), Unsatisfiable);
+        assert_eq!(parse_range("bytes=-5", 0), Unsatisfiable);
+        assert_eq!(
+            parse_range("bytes=99999999999999999999999-", 10),
+            Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn strange_ranges_are_ignored() {
+        for header in [
+            "", "bytes", "bytes=", "bytes=-", "bytes=abc", "bytes=a-b", "bytes=5-3",
+            "items=0-3", "bytes=0-3,5-6", "bytes=+1-2", "bytes=1 -2", "bytes=--5",
+            "bytes=0x1-2",
+        ] {
+            assert_eq!(
+                parse_range(header, 10),
+                RangeOutcome::Full,
+                "should ignore {header:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_byte_range_gets_206() {
+        let site = TempSite::new("range-basic");
+        let response = serve(site.path(), &with_range("/digits.txt", "bytes=2-5")).await;
+        assert_eq!(response.status, 206);
+        assert_eq!(
+            header_of(&response, "Content-Range").as_deref(),
+            Some("bytes 2-5/10")
+        );
+        assert_eq!(response.content_length(), 4);
+        assert_eq!(full_body(&response).await, b"2345");
+        assert!(header_of(&response, "ETag").is_some());
+    }
+
+    #[tokio::test]
+    async fn open_ended_and_suffix_ranges_work() {
+        let site = TempSite::new("range-forms");
+        for (range, expected) in [
+            ("bytes=7-", "789"),
+            ("bytes=-3", "789"),
+            ("bytes=0-0", "0"),
+            ("bytes=5-500", "56789"),
+        ] {
+            let response = serve(site.path(), &with_range("/digits.txt", range)).await;
+            assert_eq!(response.status, 206, "{range}");
+            assert_eq!(full_body(&response).await, expected.as_bytes(), "{range}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unsatisfiable_range_gets_416() {
+        let site = TempSite::new("range-416");
+        for range in ["bytes=10-", "bytes=50-60", "bytes=-0"] {
+            let response = serve(site.path(), &with_range("/digits.txt", range)).await;
+            assert_eq!(response.status, 416, "{range}");
+            assert_eq!(
+                header_of(&response, "Content-Range").as_deref(),
+                Some("bytes */10")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unusable_range_headers_are_ignored() {
+        let site = TempSite::new("range-ignored");
+        for range in ["bytes=0-3,5-6", "bytes=5-3", "items=0-3", "garbage"] {
+            let response = serve(site.path(), &with_range("/digits.txt", range)).await;
+            assert_eq!(response.status, 200, "{range}");
+            assert_eq!(full_body(&response).await, b"0123456789", "{range}");
+        }
+    }
+
+    #[tokio::test]
+    async fn full_responses_advertise_range_support() {
+        let site = TempSite::new("range-advert");
+        let response = serve(site.path(), &get("/digits.txt")).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            header_of(&response, "Accept-Ranges").as_deref(),
+            Some("bytes")
+        );
+    }
+
+    #[tokio::test]
+    async fn if_range_with_the_current_etag_allows_the_range() {
+        let site = TempSite::new("ifrange-etag");
+        let first = serve(site.path(), &get("/digits.txt")).await;
+        let etag = header_of(&first, "ETag").unwrap();
+
+        let request = get_with(
+            "/digits.txt",
+            &[("Range", "bytes=0-1"), ("If-Range", etag.as_str())],
+        );
+        let response = serve(site.path(), &request).await;
+        assert_eq!(response.status, 206);
+        assert_eq!(full_body(&response).await, b"01");
+    }
+
+    #[tokio::test]
+    async fn if_range_with_a_stale_etag_sends_the_whole_file() {
+        let site = TempSite::new("ifrange-stale");
+        let request = get_with(
+            "/digits.txt",
+            &[("Range", "bytes=0-1"), ("If-Range", "\"stale\"")],
+        );
+        let response = serve(site.path(), &request).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(full_body(&response).await, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn weak_etags_never_satisfy_if_range() {
+        let site = TempSite::new("ifrange-weak");
+        let first = serve(site.path(), &get("/digits.txt")).await;
+        let weak = format!("W/{}", header_of(&first, "ETag").unwrap());
+
+        let request = get_with(
+            "/digits.txt",
+            &[("Range", "bytes=0-1"), ("If-Range", weak.as_str())],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn if_range_with_the_exact_date_allows_the_range() {
+        let site = TempSite::new("ifrange-date");
+        let first = serve(site.path(), &get("/digits.txt")).await;
+        let date = header_of(&first, "Last-Modified").unwrap();
+
+        let request = get_with(
+            "/digits.txt",
+            &[("Range", "bytes=0-1"), ("If-Range", date.as_str())],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 206);
+    }
+
+    #[tokio::test]
+    async fn if_range_with_a_different_date_sends_the_whole_file() {
+        let site = TempSite::new("ifrange-olddate");
+        let request = get_with(
+            "/digits.txt",
+            &[
+                ("Range", "bytes=0-1"),
+                ("If-Range", "Thu, 01 Jan 1970 00:00:00 GMT"),
+            ],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn not_modified_beats_range() {
+        let site = TempSite::new("range-304");
+        let first = serve(site.path(), &get("/digits.txt")).await;
+        let etag = header_of(&first, "ETag").unwrap();
+
+        let request = get_with(
+            "/digits.txt",
+            &[("Range", "bytes=0-1"), ("If-None-Match", etag.as_str())],
+        );
+        assert_eq!(serve(site.path(), &request).await.status, 304);
+    }
+
+    #[tokio::test]
+    async fn small_files_are_sent_from_memory() {
+        let site = TempSite::new("small");
+        let response = serve(site.path(), &get("/digits.txt")).await;
+        assert!(response.file.is_none());
+        assert_eq!(response.body, b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn big_files_are_streamed_not_loaded() {
+        let site = TempSite::new("big");
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(site.root.join("big.bin"), &data).unwrap();
+
+        let whole = serve(site.path(), &get("/big.bin")).await;
+        assert_eq!(whole.status, 200);
+        assert!(whole.file.is_some());
+        assert!(whole.body.is_empty());
+        assert_eq!(whole.content_length(), 200_000);
+        assert_eq!(full_body(&whole).await, data);
+
+        let part = serve(site.path(), &with_range("/big.bin", "bytes=150000-150099")).await;
+        assert_eq!(part.status, 206);
+        assert_eq!(
+            header_of(&part, "Content-Range").as_deref(),
+            Some("bytes 150000-150099/200000")
+        );
+        assert_eq!(full_body(&part).await, data[150000..150100].to_vec());
     }
 }

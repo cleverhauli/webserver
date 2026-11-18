@@ -9,10 +9,11 @@ use config::Config;
 use http::chunked::decode_chunked;
 use http::parser::{body_framing, parse_request, BodyFraming, ParseError, ParseResult};
 use http::request::Method;
-use http::response::Response;
+use http::response::{FileSlice, Response};
 use router::Router;
+use std::io::SeekFrom;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -192,14 +193,56 @@ async fn handle_connection(
     send(&mut stream, response, include_body).await
 }
 
-/// Write a response to the client.
+/// Write a response to the client. Small bodies go out in one write. File
+/// slices are streamed from disk in small pieces, so memory use stays tiny
+/// whatever the file size.
 async fn send(
     stream: &mut TcpStream,
     response: Response,
     include_body: bool,
 ) -> std::io::Result<()> {
-    stream.write_all(&response.to_bytes(include_body)).await?;
+    match &response.file {
+        None => {
+            stream
+                .write_all(&response.to_bytes(include_body))
+                .await?;
+        }
+        Some(slice) => {
+            // Open the file BEFORE sending any headers, so a failure can still
+            // become a clean error response.
+            let file = match open_slice(slice).await {
+                Ok(file) => file,
+                Err(e) => {
+                    warn!("could not open {}: {e}", slice.path.display());
+                    let failure = Response::text(500, "500 Internal Server Error\n");
+                    stream.write_all(&failure.to_bytes(include_body)).await?;
+                    return stream.flush().await;
+                }
+            };
+
+            stream.write_all(&response.head_bytes()).await?;
+
+            if include_body {
+                let copied = tokio::io::copy(&mut file.take(slice.len), stream).await?;
+                if copied != slice.len {
+                    // We promised more bytes than the file had left, so it
+                    // changed while we were sending it. Drop the connection.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "file changed while it was being sent",
+                    ));
+                }
+            }
+        }
+    }
     stream.flush().await
+}
+
+/// Open a file and jump to where the slice starts.
+async fn open_slice(slice: &FileSlice) -> std::io::Result<tokio::fs::File> {
+    let mut file = tokio::fs::File::open(&slice.path).await?;
+    file.seek(SeekFrom::Start(slice.start)).await?;
+    Ok(file)
 }
 
 /// Log a rejected request and tell the client why.

@@ -4,6 +4,7 @@ pub fn reason_phrase(code: u16) -> &'static str {
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
         304 => "Not Modified",
