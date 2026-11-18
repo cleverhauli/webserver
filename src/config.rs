@@ -14,6 +14,7 @@ pub struct Config {
     pub write_timeout_secs: u64,
     pub keep_alive_timeout_secs: u64,
     pub max_requests_per_connection: usize,
+    pub shutdown_grace_secs: u64,
     pub max_connections: usize,
 }
 
@@ -29,6 +30,7 @@ impl Default for Config {
             write_timeout_secs: 30,
             keep_alive_timeout_secs: 5,
             max_requests_per_connection: 100,
+            shutdown_grace_secs: 10,
             max_connections: 1000,
         }
     }
@@ -67,6 +69,9 @@ impl Config {
         }
         if self.max_requests_per_connection == 0 {
             return Err("max_requests_per_connection must be at least 1".to_string());
+        }
+        if self.shutdown_grace_secs == 0 {
+            return Err("shutdown_grace_secs must be at least 1".to_string());
         }
         Ok(())
     }
@@ -128,5 +133,16 @@ mod tests {
     fn zero_keep_alive_settings_are_rejected() {
         assert!(Config::from_toml_str("keep_alive_timeout_secs = 0").is_err());
         assert!(Config::from_toml_str("max_requests_per_connection = 0").is_err());
+    }
+
+    #[test]
+    fn shutdown_grace_has_a_default() {
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.shutdown_grace_secs, 10);
+    }
+
+    #[test]
+    fn zero_shutdown_grace_is_rejected() {
+        assert!(Config::from_toml_str("shutdown_grace_secs = 0").is_err());
     }
 }

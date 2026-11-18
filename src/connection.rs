@@ -6,6 +6,7 @@ use crate::net_util::{ReadOutcome, read_with_deadline};
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tokio::time::Instant;
+use tokio::sync::watch;
 use tracing::debug;
 
 /// What reading from a connection produced.
@@ -25,6 +26,16 @@ pub enum Failure {
     TimedOut,
 }
 
+
+/// Completes when shutdown has been requested. If the sender is gone,
+/// nobody can request it any more, so this waits forever instead.
+pub async fn shutdown_requested(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|stopping| *stopping).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+
 /// Read the next request from a connection.
 ///
 /// `buffer` is kept between calls. It can already hold the start of the NEXT
@@ -39,15 +50,23 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     buffer: &mut Vec<u8>,
     config: &Config,
     idle_timeout: Duration,
+    stop: &mut watch::Receiver<bool>,
 ) -> std::io::Result<Incoming> {
     let read_limit = Duration::from_secs(config.read_timeout_secs);
     let mut chunk = [0u8; 4096];
 
     // Wait for the first byte, unless leftover bytes are already waiting.
+    // This is the ONLY place a shutdown interrupts us: a connection that is
+    // idle can simply be closed, but a request that has started is finished.
     if buffer.is_empty() {
-        match read_with_deadline(reader, &mut chunk, Instant::now() + idle_timeout).await? {
-            ReadOutcome::Data(n) => buffer.extend_from_slice(&chunk[..n]),
-            ReadOutcome::Closed | ReadOutcome::TimedOut => return Ok(Incoming::Finished),
+        tokio::select! {
+            outcome = read_with_deadline(reader, &mut chunk, Instant::now() + idle_timeout) => {
+                match outcome? {
+                    ReadOutcome::Data(n) => buffer.extend_from_slice(&chunk[..n]),
+                    ReadOutcome::Closed | ReadOutcome::TimedOut => return Ok(Incoming::Finished),
+                }
+            }
+            _ = shutdown_requested(stop) => return Ok(Incoming::Finished),
         }
     }
 
@@ -173,7 +192,17 @@ mod tests {
             other => panic!("expected a request, got {other:?}"),
         }
     }
-
+    
+    /// Most tests never shut down. With the sender dropped, nobody can ask for it.
+    async fn read_request<R: AsyncRead + Unpin>(
+        reader: &mut R,
+        buffer: &mut Vec<u8>,
+        config: &Config,
+        idle_timeout: Duration,
+    ) -> std::io::Result<Incoming> {
+        let (_, mut stop) = watch::channel(false);
+        super::read_request(reader, buffer, config, idle_timeout, &mut stop).await
+    }
     // ---------- reading requests from a connection ----------
 
     #[tokio::test]
@@ -442,5 +471,118 @@ mod tests {
             &[("Connection", "keep-alive"), ("connection", "close")],
         );
         assert!(!client_allows_keep_alive(&r));
+    }
+
+    // ---------- shutting down ----------
+
+    #[tokio::test]
+    async fn an_idle_connection_closes_at_once_when_shutdown_starts() {
+        let (_client, mut server) = tokio::io::duplex(4096);
+        let (tx, mut stop) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+
+        let config = Config::default();
+        let mut buffer = Vec::new();
+        let started = Instant::now();
+        let outcome = super::read_request(
+            &mut server,
+            &mut buffer,
+            &config,
+            Duration::from_secs(30),
+            &mut stop,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, Incoming::Finished));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_request_in_progress_is_finished_even_during_shutdown() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (tx, mut stop) = watch::channel(false);
+
+        // Half a request arrives first...
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+
+        // ...then shutdown starts, and only afterwards the request is completed.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = tx.send(true);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            client.write_all(b"\r\n").await.unwrap();
+        });
+
+        let config = Config::default();
+        let mut buffer = Vec::new();
+        let request = expect_request(
+            super::read_request(
+                &mut server,
+                &mut buffer,
+                &config,
+                Duration::from_secs(5),
+                &mut stop,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(request.target, "/health");
+    }
+
+    #[tokio::test]
+    async fn bytes_already_received_are_still_served_during_shutdown() {
+        let (_client, mut server) = tokio::io::duplex(4096);
+        let (tx, mut stop) = watch::channel(false);
+        tx.send(true).unwrap();
+
+        // A whole request was already waiting in the buffer.
+        let config = Config::default();
+        let mut buffer = b"GET /queued HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        let request = expect_request(
+            super::read_request(
+                &mut server,
+                &mut buffer,
+                &config,
+                Duration::from_secs(5),
+                &mut stop,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(request.target, "/queued");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_shutdown_sender_does_not_close_connections() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (tx, mut stop) = watch::channel(false);
+        drop(tx);
+
+        client
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+
+        let config = Config::default();
+        let mut buffer = Vec::new();
+        let request = expect_request(
+            super::read_request(
+                &mut server,
+                &mut buffer,
+                &config,
+                Duration::from_secs(5),
+                &mut stop,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(request.target, "/ok");
     }
 }

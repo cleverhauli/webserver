@@ -8,7 +8,7 @@ mod static_files;
 
 use clap::Parser;
 use config::Config;
-use connection::{client_allows_keep_alive, read_request, Failure, Incoming};
+use connection::{Failure, Incoming, client_allows_keep_alive, read_request};
 use http::parser::ParseError;
 use http::request::Method;
 use http::response::{FileSlice, Response};
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 /// Command-line options.
@@ -43,6 +43,29 @@ fn build_router() -> Router {
         .add(Method::Get, "/about", handlers::about)
         .add(Method::Get, "/echo", handlers::echo)
         .add(Method::Post, "/echo", handlers::echo)
+}
+
+/// Completes when the user asks the server to stop: Ctrl+C everywhere,
+/// and also SIGTERM on Linux and macOS (what service managers send).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = terminate.recv() => {}
+            }
+            return;
+        }
+    }
+
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        // Without a working signal handler we can never be asked to stop
+        // gracefully, but the server itself should keep running.
+        error!("could not listen for Ctrl+C: {e}");
+        std::future::pending::<()>().await;
+    }
 }
 
 #[tokio::main]
@@ -84,19 +107,35 @@ async fn main() -> std::io::Result<()> {
     );
 
     let write_timeout = Duration::from_secs(config.write_timeout_secs);
+    let grace = Duration::from_secs(config.shutdown_grace_secs);
+    let max_connections = config.max_connections;
+
     // The semaphore hands out one "permit" per connection we are willing to
     // handle at once. When all permits are taken, new connections are refused.
-    let limiter = Arc::new(Semaphore::new(config.max_connections));
+    // At shutdown, getting ALL the permits back means every connection is done.
+    let limiter = Arc::new(Semaphore::new(max_connections));
     let config = Arc::new(config);
     let router = Arc::new(build_router());
 
+    // A one-value broadcast: false while running, true once we are stopping.
+    let (stop_tx, stop_rx) = watch::channel(false);
+
     let listener = TcpListener::bind(&address).await?;
-    info!("Listening on http://{address}");
+    info!("Listening on http://{address} (press Ctrl+C to stop)");
+
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
+        // Wait for a new connection OR for the signal to stop.
+        let accepted = tokio::select! {
+            _ = &mut shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+
         // A failed accept (for example a connection that died during the
         // handshake) must never stop the whole server.
-        let (stream, addr) = match listener.accept().await {
+        let (stream, addr) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
                 warn!("accept failed: {e}");
@@ -117,10 +156,11 @@ async fn main() -> std::io::Result<()> {
 
         let config = Arc::clone(&config);
         let router = Arc::clone(&router);
+        let stop = stop_rx.clone();
         tokio::spawn(async move {
             // Holding the permit until this task ends keeps the slot taken.
             let _permit = permit;
-            if let Err(e) = handle_connection(stream, config, router).await {
+            if let Err(e) = handle_connection(stream, config, router, stop).await {
                 if is_routine_disconnect(&e) {
                     debug!("{addr}: connection ended early: {e}");
                 } else {
@@ -130,6 +170,42 @@ async fn main() -> std::io::Result<()> {
             debug!("{addr}: connection closed");
         });
     }
+
+    // ---------- graceful shutdown ----------
+    info!("Shutting down: no longer accepting new connections");
+
+    // Closing the listener makes the operating system refuse newcomers.
+    drop(listener);
+    // Tell every connection: finish what you are doing, then close.
+    stop_tx.send_replace(true);
+
+    let in_flight = max_connections.saturating_sub(limiter.available_permits());
+    if in_flight > 0 {
+        info!(
+            "Waiting up to {}s for {in_flight} connection(s) to finish (press Ctrl+C again to stop now)",
+            grace.as_secs()
+        );
+    }
+
+    // Getting every permit back means every connection has ended.
+    let all_permits = u32::try_from(max_connections).unwrap_or(u32::MAX);
+    let finished_in_time = tokio::select! {
+        result = tokio::time::timeout(grace, limiter.acquire_many(all_permits)) => result.is_ok(),
+        _ = tokio::signal::ctrl_c() => {
+            warn!("Second Ctrl+C: not waiting any longer");
+            false
+        }
+    };
+
+    if finished_in_time {
+        info!("All connections finished. Goodbye!");
+    } else {
+        let cut_off = max_connections.saturating_sub(limiter.available_permits());
+        warn!("Stopping now. {cut_off} connection(s) were cut off.");
+    }
+
+    // Returning from main ends the program and drops any connection left.
+    Ok(())
 }
 
 /// Tell a client we are full, then hang up.
@@ -143,6 +219,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     config: Arc<Config>,
     router: Arc<Router>,
+    mut stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let first_request_wait = Duration::from_secs(config.read_timeout_secs);
     let idle_wait = Duration::from_secs(config.keep_alive_timeout_secs);
@@ -156,9 +233,14 @@ async fn handle_connection(
     loop {
         // A brand-new connection gets the normal read limit to speak up.
         // After that, we only wait the (shorter) idle time for the next request.
-        let wait = if served == 0 { first_request_wait } else { idle_wait };
+        let wait = if served == 0 {
+            first_request_wait
+        } else {
+            idle_wait
+        };
 
-        let request = match read_request(&mut stream, &mut buffer, &config, wait).await? {
+        let request = match read_request(&mut stream, &mut buffer, &config, wait, &mut stop).await?
+        {
             Incoming::Request(request) => request,
             Incoming::Finished => {
                 debug!("connection finished after {served} request(s)");
@@ -185,8 +267,11 @@ async fn handle_connection(
             router.handle(&request)
         };
 
+        // Keep the connection open only if the client allows it, we have not
+        // served too many requests, AND the server is not shutting down.
         let keep_open = client_allows_keep_alive(&request)
-            && served < config.max_requests_per_connection;
+            && served < config.max_requests_per_connection
+            && !*stop.borrow();
         response.keep_alive = keep_open;
 
         info!(
