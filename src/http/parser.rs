@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(body_framing(&req, 1000), Err(ParseError::PayloadTooLarge));
     }
 
-        #[test]
+    #[test]
     fn chunked_is_understood() {
         let req = request_with("Transfer-Encoding: chunked\r\n");
         assert_eq!(body_framing(&req, 1000), Ok(BodyFraming::Chunked));

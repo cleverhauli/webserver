@@ -1,7 +1,7 @@
 //! The server itself: accepting connections, limits, and graceful shutdown.
 
 use crate::config::Config;
-use crate::connection::{client_allows_keep_alive, read_request, Failure, Incoming};
+use crate::connection::{Failure, Incoming, client_allows_keep_alive, read_request};
 use crate::handlers;
 use crate::http::parser::ParseError;
 use crate::http::request::Method;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 /// The special pages this server offers. Everything else is looked up as a
@@ -185,24 +185,28 @@ async fn handle_connection(
     loop {
         // A brand-new connection gets the normal read limit to speak up.
         // After that, we only wait the (shorter) idle time for the next request.
-        let wait = if served == 0 { first_request_wait } else { idle_wait };
+        let wait = if served == 0 {
+            first_request_wait
+        } else {
+            idle_wait
+        };
 
-        let request =
-            match read_request(&mut stream, &mut buffer, &config, wait, &mut stop).await? {
-                Incoming::Request(request) => request,
-                Incoming::Finished => {
-                    debug!("connection finished after {served} request(s)");
-                    return Ok(());
-                }
-                // After an error we no longer trust where the next request
-                // would start, so we always close.
-                Incoming::Failed(Failure::Parse(e)) => {
-                    return reject(&mut stream, e, write_timeout).await;
-                }
-                Incoming::Failed(Failure::TimedOut) => {
-                    return request_timeout(&mut stream, write_timeout).await;
-                }
-            };
+        let request = match read_request(&mut stream, &mut buffer, &config, wait, &mut stop).await?
+        {
+            Incoming::Request(request) => request,
+            Incoming::Finished => {
+                debug!("connection finished after {served} request(s)");
+                return Ok(());
+            }
+            // After an error we no longer trust where the next request
+            // would start, so we always close.
+            Incoming::Failed(Failure::Parse(e)) => {
+                return reject(&mut stream, e, write_timeout).await;
+            }
+            Incoming::Failed(Failure::TimedOut) => {
+                return request_timeout(&mut stream, write_timeout).await;
+            }
+        };
         served += 1;
 
         // Decide who answers. A registered route wins. Otherwise GET and

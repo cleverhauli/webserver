@@ -214,10 +214,8 @@ fn is_not_modified(request: &Request, validators: &Validators) -> bool {
 
     if let Some(value) = request.header("if-modified-since") {
         // A date we cannot understand is simply ignored.
-        if let Ok(since) = httpdate::parse_http_date(value) {
-            if let Ok(since) = since.duration_since(UNIX_EPOCH) {
-                return validators.modified_secs <= since.as_secs();
-            }
+        if let Ok(since) = httpdate::parse_http_date(value) && let Ok(since) = since.duration_since(UNIX_EPOCH) {
+            return validators.modified_secs <= since.as_secs();
         }
     }
 
@@ -293,11 +291,11 @@ fn parse_range(header: &str, size: u64) -> RangeOutcome {
     };
 
     // "5-3" is nonsense, so ignore it.
-    if let Some(end) = end {
-        if end < start {
+    if let Some(end) = end 
+        && end < start {
             return RangeOutcome::Full;
-        }
     }
+    
     if start >= size {
         return RangeOutcome::Unsatisfiable;
     }
@@ -325,7 +323,7 @@ fn if_range_allows(request: &Request, validators: &Validators) -> bool {
     match httpdate::parse_http_date(value) {
         Ok(date) => date
             .duration_since(UNIX_EPOCH)
-            .map_or(false, |d| d.as_secs() == validators.modified_secs),
+            .is_ok_and(|d| d.as_secs() == validators.modified_secs),
         Err(_) => false,
     }
 }
@@ -375,11 +373,10 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
     let validators = file_validators(&metadata);
 
     // "Has it changed?" comes first, so a 304 costs almost nothing.
-    if let Some(v) = &validators {
-        if is_not_modified(request, v) {
+    if let Some(v) = &validators 
+        && is_not_modified(request, v) {
             return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
         }
-    }
 
     // Does the client want only part of the file?
     let range_allowed = match &validators {
@@ -881,7 +878,10 @@ mod tests {
         assert_eq!(parse_range("bytes=5-500", 10), Partial { start: 5, end: 9 });
         assert_eq!(parse_range("bytes=-500", 10), Partial { start: 0, end: 9 });
         assert_eq!(parse_range("BYTES=0-0", 10), Partial { start: 0, end: 0 });
-        assert_eq!(parse_range("  bytes=1-2  ", 10), Partial { start: 1, end: 2 });
+        assert_eq!(
+            parse_range("  bytes=1-2  ", 10),
+            Partial { start: 1, end: 2 }
+        );
         assert_eq!(
             parse_range("bytes=5-99999999999999999999999", 10),
             Partial { start: 5, end: 9 }
@@ -909,8 +909,18 @@ mod tests {
     #[test]
     fn strange_ranges_are_ignored() {
         for header in [
-            "", "bytes", "bytes=", "bytes=-", "bytes=abc", "bytes=a-b", "bytes=5-3",
-            "items=0-3", "bytes=0-3,5-6", "bytes=+1-2", "bytes=1 -2", "bytes=--5",
+            "",
+            "bytes",
+            "bytes=",
+            "bytes=-",
+            "bytes=abc",
+            "bytes=a-b",
+            "bytes=5-3",
+            "items=0-3",
+            "bytes=0-3,5-6",
+            "bytes=+1-2",
+            "bytes=1 -2",
+            "bytes=--5",
             "bytes=0x1-2",
         ] {
             assert_eq!(

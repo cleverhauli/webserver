@@ -5,8 +5,8 @@ use crate::http::request::{Request, Version};
 use crate::net_util::{ReadOutcome, read_with_deadline};
 use std::time::Duration;
 use tokio::io::AsyncRead;
-use tokio::time::Instant;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::debug;
 
 /// What reading from a connection produced.
@@ -26,7 +26,6 @@ pub enum Failure {
     TimedOut,
 }
 
-
 /// Completes when shutdown has been requested. If the sender is gone,
 /// nobody can request it any more, so this waits forever instead.
 pub async fn shutdown_requested(stop: &mut watch::Receiver<bool>) {
@@ -34,7 +33,6 @@ pub async fn shutdown_requested(stop: &mut watch::Receiver<bool>) {
         std::future::pending::<()>().await;
     }
 }
-
 
 /// Read the next request from a connection.
 ///
@@ -192,7 +190,7 @@ mod tests {
             other => panic!("expected a request, got {other:?}"),
         }
     }
-    
+
     /// Most tests never shut down. With the sender dropped, nobody can ask for it.
     async fn read_request<R: AsyncRead + Unpin>(
         reader: &mut R,

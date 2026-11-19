@@ -77,7 +77,7 @@ pub fn decode_chunked(
         let too_big = body
             .len()
             .checked_add(size)
-            .map_or(true, |total| total > max_body_bytes);
+            .is_none_or(|total| total > max_body_bytes);
         if too_big {
             return Err(ParseError::PayloadTooLarge);
         }

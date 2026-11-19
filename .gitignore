@@ -1,2 +1,5 @@
 /target
 /public/big.bin
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts

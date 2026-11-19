@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{get, parse_responses, raw_exchange, read_until_closed, TestServer};
+use common::{TestServer, get, parse_responses, raw_exchange, read_until_closed};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -75,8 +75,14 @@ async fn idle_keep_alive_connections_are_closed() {
     let responses = parse_responses(&data);
     assert_eq!(responses.len(), 1);
     assert_eq!(responses[0].header("connection"), Some("keep-alive"));
-    assert!(waited >= Duration::from_millis(800), "closed too early: {waited:?}");
-    assert!(waited < Duration::from_secs(5), "closed too late: {waited:?}");
+    assert!(
+        waited >= Duration::from_millis(800),
+        "closed too early: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(5),
+        "closed too late: {waited:?}"
+    );
 }
 
 #[tokio::test]
@@ -159,7 +165,11 @@ async fn silent_connections_are_closed_without_a_response() {
     let started = Instant::now();
     let data = read_until_closed(&mut stream).await;
 
-    assert!(data.is_empty(), "expected no response, got {} bytes", data.len());
+    assert!(
+        data.is_empty(),
+        "expected no response, got {} bytes",
+        data.len()
+    );
     assert!(started.elapsed() < Duration::from_secs(5));
 }
 
@@ -198,7 +208,10 @@ async fn very_long_targets_get_414() {
 async fn oversized_headers_get_431() {
     // A small limit, so the whole request arrives in one read.
     let server = TestServer::start_with("big-headers", |c| c.max_header_bytes = 200).await;
-    let request = format!("GET / HTTP/1.1\r\nHost: x\r\nX-Big: {}\r\n\r\n", "a".repeat(300));
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: x\r\nX-Big: {}\r\n\r\n",
+        "a".repeat(300)
+    );
     let data = raw_exchange(server.addr, request.as_bytes()).await;
     assert_eq!(parse_responses(&data)[0].status, 431);
 }
@@ -247,7 +260,9 @@ async fn chunked_bodies_are_decoded() {
     let responses = parse_responses(&data);
     assert_eq!(responses[0].status, 200);
     assert!(
-        responses[0].text().contains("Body (11 bytes):\nhello world"),
+        responses[0]
+            .text()
+            .contains("Body (11 bytes):\nhello world"),
         "{}",
         responses[0].text()
     );
@@ -276,7 +291,10 @@ async fn path_traversal_attempts_never_leak_files() {
     ] {
         let response = get(server.addr, target).await;
         assert_eq!(response.status, 404, "should block {target}");
-        assert!(!response.text().contains("TOP-SECRET"), "leaked via {target}");
+        assert!(
+            !response.text().contains("TOP-SECRET"),
+            "leaked via {target}"
+        );
         assert!(!response.text().contains("hidden"), "leaked via {target}");
     }
 }

@@ -1,0 +1,22 @@
+[package]
+name = "webserver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+webserver = { path = ".." }
+
+# The fuzz crate is its own project, not part of the main one.
+[workspace]
+
+[[bin]]
+name = "parser"
+path = "fuzz_targets/parser.rs"
+test = false
+doc = false
+bench = false

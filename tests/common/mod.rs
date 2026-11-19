@@ -20,8 +20,7 @@ pub struct Site {
 
 impl Site {
     pub fn new(name: &str) -> Site {
-        let base =
-            std::env::temp_dir().join(format!("webserver-it-{}-{name}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("webserver-it-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let root = base.join("site");
         std::fs::create_dir_all(root.join("docs")).unwrap();
