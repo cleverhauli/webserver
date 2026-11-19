@@ -214,7 +214,9 @@ fn is_not_modified(request: &Request, validators: &Validators) -> bool {
 
     if let Some(value) = request.header("if-modified-since") {
         // A date we cannot understand is simply ignored.
-        if let Ok(since) = httpdate::parse_http_date(value) && let Ok(since) = since.duration_since(UNIX_EPOCH) {
+        if let Ok(since) = httpdate::parse_http_date(value)
+            && let Ok(since) = since.duration_since(UNIX_EPOCH)
+        {
             return validators.modified_secs <= since.as_secs();
         }
     }
@@ -291,11 +293,12 @@ fn parse_range(header: &str, size: u64) -> RangeOutcome {
     };
 
     // "5-3" is nonsense, so ignore it.
-    if let Some(end) = end 
-        && end < start {
-            return RangeOutcome::Full;
+    if let Some(end) = end
+        && end < start
+    {
+        return RangeOutcome::Full;
     }
-    
+
     if start >= size {
         return RangeOutcome::Unsatisfiable;
     }
@@ -373,10 +376,11 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
     let validators = file_validators(&metadata);
 
     // "Has it changed?" comes first, so a 304 costs almost nothing.
-    if let Some(v) = &validators 
-        && is_not_modified(request, v) {
-            return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
-        }
+    if let Some(v) = &validators
+        && is_not_modified(request, v)
+    {
+        return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
+    }
 
     // Does the client want only part of the file?
     let range_allowed = match &validators {
