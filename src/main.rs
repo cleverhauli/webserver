@@ -66,7 +66,6 @@ async fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
-    let address = config.address();
     info!("Serving files from '{}'", config.document_root);
     info!(
         "Limits: {} connections, {}s to send a request, {}s write timeout",
@@ -76,15 +75,31 @@ async fn main() -> std::io::Result<()> {
         "Keep-alive: {}s idle wait, up to {} requests per connection",
         config.keep_alive_timeout_secs, config.max_requests_per_connection
     );
+    let redirecting = config.tls_enabled() && config.redirect_http_to_https;
+    let hsts = config.hsts_max_age_secs;
 
     let server = match Server::bind(config).await {
         Ok(server) => server,
         Err(e) => {
-            error!("could not listen on {address}: {e}");
+            error!("could not start the server: {e}");
             std::process::exit(1);
         }
     };
-    info!("Listening on http://{address} (press Ctrl+C to stop)");
+
+    if let Ok(addr) = server.local_addr() {
+        if redirecting {
+            info!("Listening on http://{addr} (redirects to HTTPS)");
+        } else {
+            info!("Listening on http://{addr}");
+        }
+    }
+    if let Some(addr) = server.https_addr() {
+        info!("Listening on https://{addr}");
+        if hsts > 0 {
+            info!("HSTS is on: browsers will insist on HTTPS for {hsts}s");
+        }
+    }
+    info!("Press Ctrl+C to stop");
 
     // A second Ctrl+C while shutting down stops everything at once.
     let force_stop = async {

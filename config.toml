@@ -20,3 +20,23 @@ keep_alive_timeout_secs = 5
 # Most requests served on one connection before we close it.
 # Set to 1 to turn keep-alive off.
 max_requests_per_connection = 100
+
+
+# ---------- HTTPS (optional) ----------
+# Uncomment both lines to turn HTTPS on. For local testing, make a
+# development certificate with:  cargo run --example gen_cert
+tls_cert_path = "certs/dev-cert.pem"
+tls_key_path = "certs/dev-key.pem"
+
+# The port HTTPS listens on. With HTTPS on, "port" above then redirects here.
+https_port = 8443
+
+# With HTTPS on, send plain-HTTP visitors to the HTTPS site.
+redirect_http_to_https = true
+
+# Tell browsers to insist on HTTPS for this many seconds (Strict-Transport-Security).
+# Leave at 0 while testing: browsers remember it, and a mistake can lock you out.
+hsts_max_age_secs = 0
+
+# Seconds a client has to finish the TLS handshake.
+tls_handshake_timeout_secs = 10

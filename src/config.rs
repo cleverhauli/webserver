@@ -15,6 +15,17 @@ pub struct Config {
     pub keep_alive_timeout_secs: u64,
     pub max_requests_per_connection: usize,
     pub shutdown_grace_secs: u64,
+    /// Paths to a PEM certificate chain and private key. Setting both turns HTTPS on.
+    pub tls_cert_path: Option<String>,
+    pub tls_key_path: Option<String>,
+    pub https_port: u16,
+    /// The port HTTPS listens on (the normal `port` is plain HTTP).
+    pub redirect_http_to_https: bool,
+    /// With HTTPS on, answer plain-HTTP requests with a redirect to HTTPS.
+    pub hsts_max_age_secs: u64,
+    /// Strict-Transport-Security max-age in seconds. 0 means "don't send it".
+    pub tls_handshake_timeout_secs: u64,
+    /// How long a client has to finish the TLS handshake.
     pub max_connections: usize,
 }
 
@@ -31,6 +42,12 @@ impl Default for Config {
             keep_alive_timeout_secs: 5,
             max_requests_per_connection: 100,
             shutdown_grace_secs: 10,
+            tls_cert_path: None,
+            tls_key_path: None,
+            https_port: 8443,
+            redirect_http_to_https: true,
+            hsts_max_age_secs: 0,
+            tls_handshake_timeout_secs: 10,
             max_connections: 1000,
         }
     }
@@ -49,6 +66,16 @@ impl Config {
         let config: Config = toml::from_str(text).map_err(|e| format!("invalid config: {e}"))?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Is HTTPS turned on?
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
+    /// The address HTTPS listens on, like "127.0.0.1:8443".
+    pub fn https_address(&self) -> String {
+        format!("{}:{}", self.bind_addr, self.https_port)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -72,6 +99,24 @@ impl Config {
         }
         if self.shutdown_grace_secs == 0 {
             return Err("shutdown_grace_secs must be at least 1".to_string());
+        }
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            return Err("tls_cert_path and tls_key_path must be set together".to_string());
+        }
+        if self.tls_handshake_timeout_secs == 0 {
+            return Err("tls_handshake_timeout_secs must be at least 1".to_string());
+        }
+        if self.tls_enabled() {
+            if self.https_port == 0 {
+                return Err("https_port must not be 0".to_string());
+            }
+            if self.https_port == self.port {
+                return Err("https_port must be different from port".to_string());
+            }
+        } else if self.hsts_max_age_secs > 0 {
+            return Err(
+                "hsts_max_age_secs needs HTTPS (set tls_cert_path and tls_key_path)".to_string(),
+            );
         }
         Ok(())
     }
@@ -144,5 +189,47 @@ mod tests {
     #[test]
     fn zero_shutdown_grace_is_rejected() {
         assert!(Config::from_toml_str("shutdown_grace_secs = 0").is_err());
+    }
+
+    #[test]
+    fn https_is_off_by_default() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(!config.tls_enabled());
+        assert_eq!(config.https_port, 8443);
+        assert!(config.redirect_http_to_https);
+        assert_eq!(config.hsts_max_age_secs, 0);
+    }
+
+    #[test]
+    fn certificate_and_key_must_come_together() {
+        assert!(Config::from_toml_str("tls_cert_path = \"cert.pem\"").is_err());
+        assert!(Config::from_toml_str("tls_key_path = \"key.pem\"").is_err());
+    }
+
+    #[test]
+    fn certificate_and_key_together_turn_https_on() {
+        let config =
+            Config::from_toml_str("tls_cert_path = \"cert.pem\"\ntls_key_path = \"key.pem\"")
+                .unwrap();
+        assert!(config.tls_enabled());
+        assert_eq!(config.https_address(), "127.0.0.1:8443");
+    }
+
+    #[test]
+    fn https_port_must_differ_from_the_http_port() {
+        let text = "tls_cert_path = \"c\"\ntls_key_path = \"k\"\nport = 8443";
+        assert!(Config::from_toml_str(text).is_err());
+    }
+
+    #[test]
+    fn hsts_needs_https() {
+        assert!(Config::from_toml_str("hsts_max_age_secs = 60").is_err());
+        let text = "tls_cert_path = \"c\"\ntls_key_path = \"k\"\nhsts_max_age_secs = 60";
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn zero_handshake_timeout_is_rejected() {
+        assert!(Config::from_toml_str("tls_handshake_timeout_secs = 0").is_err());
     }
 }

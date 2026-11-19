@@ -3,3 +3,6 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+/certs
+*.pem
+*.key
