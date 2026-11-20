@@ -1,6 +1,9 @@
+use crate::compression::{self, Encoding};
+use crate::config::Config;
 use crate::http::request::Request;
 use crate::http::response::Response;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
 
@@ -168,8 +171,9 @@ fn redirect_to_folder(relative: &Path, target: &str) -> Response {
 }
 
 /// A file's fingerprint, used to answer "has it changed?".
+#[derive(Clone)]
 struct Validators {
-    /// Like "\"1a2-17f3b...\"" (size and modification time, in hex).
+    /// Like "\"1a2-17f3b...\"" (size and modification time, in hex), quotes included.
     etag: String,
     /// Like "Wed, 18 Nov 2026 08:30:00 GMT".
     last_modified: String,
@@ -189,10 +193,61 @@ fn file_validators(metadata: &std::fs::Metadata) -> Option<Validators> {
     })
 }
 
-fn with_validators(response: Response, validators: &Validators) -> Response {
+/// The ETag of a compressed version of a file. Different bytes need a
+/// different tag, so the encoding becomes part of it.
+fn tag_with_encoding(validators: Validators, encoding: Encoding) -> Validators {
+    let inner = validators.etag.trim_matches('"');
+    let etag = format!("\"{inner}-{}\"", encoding.token());
+    Validators { etag, ..validators }
+}
+
+/// Add ETag and Last-Modified. A weak ETag ("W/...") promises "equivalent
+/// content", which is the honest claim for a version compressed on the fly.
+fn with_validators(response: Response, validators: &Validators, weak: bool) -> Response {
+    let etag = if weak {
+        format!("W/{}", validators.etag)
+    } else {
+        validators.etag.clone()
+    };
     response
-        .header("ETag", &validators.etag)
+        .header("ETag", &etag)
         .header("Last-Modified", &validators.last_modified)
+}
+
+/// The caching-related headers every file response (and every 304) carries.
+fn with_caching_headers(
+    mut response: Response,
+    validators: Option<&Validators>,
+    weak: bool,
+    cache_control: &str,
+    vary: bool,
+) -> Response {
+    if let Some(validators) = validators {
+        response = with_validators(response, validators, weak);
+    }
+    if !cache_control.is_empty() {
+        response = response.header("Cache-Control", cache_control);
+    }
+    // The answer depends on Accept-Encoding, so shared caches must know.
+    if vary {
+        response = response.header("Vary", "Accept-Encoding");
+    }
+    response
+}
+
+/// The headers common to every successful file response.
+fn file_response(
+    status: u16,
+    content_type: &str,
+    validators: Option<&Validators>,
+    weak: bool,
+    cache_control: &str,
+    vary: bool,
+) -> Response {
+    let response = Response::new(status)
+        .header("Content-Type", content_type)
+        .header("X-Content-Type-Options", "nosniff");
+    with_caching_headers(response, validators, weak, cache_control, vary)
 }
 
 /// Does an If-None-Match header value match our ETag?
@@ -331,8 +386,103 @@ fn if_range_allows(request: &Request, validators: &Validators) -> bool {
     }
 }
 
-/// Serve a file from `document_root` for a GET or HEAD request.
+/// Which version of a file one client receives.
+enum Variant {
+    /// The file exactly as it is on disk.
+    Identity,
+    /// A ready-made "file.ext.gz" or "file.ext.br" copy, streamed from disk.
+    Precompressed {
+        path: PathBuf,
+        metadata: std::fs::Metadata,
+        encoding: Encoding,
+    },
+    /// Compressed right now, in memory.
+    OnTheFly(Encoding),
+}
+
+/// All Accept-Encoding headers of a request, joined into one list.
+fn accept_encoding_header(request: &Request) -> String {
+    request
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+        .map(|(_, value)| value.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Look for "file.ext.br" or "file.ext.gz" next to the original. It must be
+/// inside the document root, and NOT older than the original: a stale copy
+/// would serve outdated content.
+async fn find_precompressed(
+    root: &Path,
+    path: &Path,
+    encoding: Encoding,
+    original: &std::fs::Metadata,
+) -> Option<(PathBuf, std::fs::Metadata)> {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(encoding.file_extension());
+
+    let sibling = resolve_inside(root, Path::new(&name)).await?;
+    let metadata = tokio::fs::metadata(&sibling).await.ok()?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return None;
+    }
+
+    let up_to_date = match (metadata.modified(), original.modified()) {
+        (Ok(copy), Ok(source)) => copy >= source,
+        _ => false,
+    };
+    up_to_date.then_some((sibling, metadata))
+}
+
+/// Decide which version of the file to send.
+async fn choose_variant(
+    config: &Config,
+    root: &Path,
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    acceptable: &[Encoding],
+) -> Variant {
+    // A ready-made copy costs nothing, so it always wins.
+    if config.serve_precompressed {
+        for &encoding in acceptable {
+            if let Some((sibling, sibling_metadata)) =
+                find_precompressed(root, path, encoding, metadata).await
+            {
+                return Variant::Precompressed {
+                    path: sibling,
+                    metadata: sibling_metadata,
+                    encoding,
+                };
+            }
+        }
+    }
+
+    let size = metadata.len();
+    match acceptable.first() {
+        Some(&encoding)
+            if size >= config.compress_min_bytes && size <= config.compress_max_bytes =>
+        {
+            Variant::OnTheFly(encoding)
+        }
+        _ => Variant::Identity,
+    }
+}
+
+/// Serve a file for a GET or HEAD request, using default settings.
 pub async fn serve(document_root: &str, request: &Request) -> Response {
+    let config = Config {
+        document_root: document_root.to_string(),
+        ..Config::default()
+    };
+    serve_with_config(&config, request).await
+}
+
+/// Serve a file from the document root for a GET or HEAD request.
+pub async fn serve_with_config(config: &Config, request: &Request) -> Response {
+    let document_root = config.document_root.as_str();
+
     let Some(relative) = safe_relative_path(&request.target) else {
         warn!("blocked suspicious path: {}", request.target);
         return not_found();
@@ -373,17 +523,55 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
     }
 
     let size = metadata.len();
-    let validators = file_validators(&metadata);
+    let identity_validators = file_validators(&metadata);
+    let content_type = content_type_for(&path);
+    let cache_control = config.cache_control_for(&path);
+    let compressible = config.compression && compression::is_compressible(&content_type);
+
+    // Which version does this client get? A Range request always gets the
+    // original bytes, because byte positions only make sense for those.
+    let wants_range = request.header("range").is_some();
+    let acceptable = if compressible && !wants_range {
+        compression::acceptable_encodings(&accept_encoding_header(request))
+    } else {
+        Vec::new()
+    };
+    let variant = choose_variant(config, &root, &path, &metadata, &acceptable).await;
+
+    // The fingerprint of the version we are about to send. A compressed
+    // version has different bytes, so it gets its own ETag.
+    let (validators, weak) = match &variant {
+        Variant::Identity => (identity_validators.clone(), false),
+        Variant::Precompressed {
+            metadata, encoding, ..
+        } => (
+            file_validators(metadata).map(|v| tag_with_encoding(v, *encoding)),
+            false,
+        ),
+        Variant::OnTheFly(encoding) => (
+            identity_validators
+                .clone()
+                .map(|v| tag_with_encoding(v, *encoding)),
+            true,
+        ),
+    };
 
     // "Has it changed?" comes first, so a 304 costs almost nothing.
     if let Some(v) = &validators
         && is_not_modified(request, v)
     {
-        return with_validators(Response::new(304), v).header("Cache-Control", "no-cache");
+        return with_caching_headers(
+            Response::new(304),
+            validators.as_ref(),
+            weak,
+            cache_control,
+            compressible,
+        );
     }
 
-    // Does the client want only part of the file?
-    let range_allowed = match &validators {
+    // Does the client want only part of the file? (Only possible for the
+    // original bytes, since a Range request never gets a compressed version.)
+    let range_allowed = match &identity_validators {
         Some(v) => if_range_allows(request, v),
         None => request.header("if-range").is_none(),
     };
@@ -392,36 +580,80 @@ pub async fn serve(document_root: &str, request: &Request) -> Response {
         _ => RangeOutcome::Full,
     };
 
-    let content_type = content_type_for(&path);
-    let base = |status: u16| {
-        let mut response = Response::new(status)
-            .header("Content-Type", &content_type)
-            .header("X-Content-Type-Options", "nosniff")
-            .header("Cache-Control", "no-cache")
-            .header("Accept-Ranges", "bytes");
-        if let Some(v) = &validators {
-            response = with_validators(response, v);
-        }
-        response
+    let identity = |status: u16| {
+        file_response(
+            status,
+            &content_type,
+            identity_validators.as_ref(),
+            false,
+            cache_control,
+            compressible,
+        )
+        .header("Accept-Ranges", "bytes")
+    };
+    let encoded = |status: u16| {
+        file_response(
+            status,
+            &content_type,
+            validators.as_ref(),
+            weak,
+            cache_control,
+            compressible,
+        )
     };
 
-    match outcome {
-        RangeOutcome::Unsatisfiable => Response::text(416, "416 Range Not Satisfiable\n")
-            .header("Content-Range", &format!("bytes */{size}")),
+    match variant {
+        // A ready-made copy: stream it from disk, whatever its size.
+        Variant::Precompressed {
+            path: copy,
+            metadata: copy_metadata,
+            encoding,
+        } => encoded(200)
+            .header("Content-Encoding", encoding.token())
+            .with_file(copy, 0, copy_metadata.len()),
 
-        RangeOutcome::Partial { start, end } => base(206)
-            .header("Content-Range", &format!("bytes {start}-{end}/{size}"))
-            .with_file(path, start, end - start + 1),
+        // Compress now. The file is held in memory, which is why this is
+        // limited to `compress_max_bytes`.
+        Variant::OnTheFly(encoding) => {
+            let data = match tokio::fs::read(&path).await {
+                Ok(bytes) => Arc::new(bytes),
+                Err(e) => {
+                    warn!("could not read {}: {e}", path.display());
+                    return Response::text(500, "500 Internal Server Error\n");
+                }
+            };
 
-        RangeOutcome::Full if size <= SMALL_FILE_BYTES => match tokio::fs::read(&path).await {
-            Ok(bytes) => base(200).body(bytes),
-            Err(e) => {
-                warn!("could not read {}: {e}", path.display());
-                Response::text(500, "500 Internal Server Error\n")
+            match compression::compress_shared(encoding, Arc::clone(&data)).await {
+                // Only worth sending if it really is smaller.
+                Ok(compressed) if compressed.len() < data.len() => encoded(200)
+                    .header("Content-Encoding", encoding.token())
+                    .body(compressed),
+                Ok(_) => identity(200).body(data.to_vec()),
+                Err(e) => {
+                    warn!("compression failed for {}: {e}", path.display());
+                    identity(200).body(data.to_vec())
+                }
             }
-        },
+        }
 
-        RangeOutcome::Full => base(200).with_file(path, 0, size),
+        Variant::Identity => match outcome {
+            RangeOutcome::Unsatisfiable => Response::text(416, "416 Range Not Satisfiable\n")
+                .header("Content-Range", &format!("bytes */{size}")),
+
+            RangeOutcome::Partial { start, end } => identity(206)
+                .header("Content-Range", &format!("bytes {start}-{end}/{size}"))
+                .with_file(path, start, end - start + 1),
+
+            RangeOutcome::Full if size <= SMALL_FILE_BYTES => match tokio::fs::read(&path).await {
+                Ok(bytes) => identity(200).body(bytes),
+                Err(e) => {
+                    warn!("could not read {}: {e}", path.display());
+                    Response::text(500, "500 Internal Server Error\n")
+                }
+            },
+
+            RangeOutcome::Full => identity(200).with_file(path, 0, size),
+        },
     }
 }
 
@@ -1105,5 +1337,411 @@ mod tests {
             Some("bytes 150000-150099/200000")
         );
         assert_eq!(full_body(&part).await, data[150000..150100].to_vec());
+    }
+
+    // ---------- compression and caching ----------
+
+    use crate::config::CacheRule;
+
+    fn site_config(site: &TempSite) -> Config {
+        Config {
+            document_root: site.path().to_string(),
+            ..Config::default()
+        }
+    }
+
+    fn accepting(target: &str, accept: &str) -> Request {
+        get_with(target, &[("Accept-Encoding", accept)])
+    }
+
+    fn gunzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut out)
+            .unwrap();
+        out
+    }
+
+    fn unbrotli(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        brotli::BrotliDecompress(&mut std::io::Cursor::new(bytes), &mut out).unwrap();
+        out
+    }
+
+    /// A script big enough, and repetitive enough, to be worth compressing.
+    fn script() -> String {
+        "console.log('hello from the web server');\n".repeat(100)
+    }
+
+    fn write_script(site: &TempSite) {
+        std::fs::write(site.root.join("app.js"), script()).unwrap();
+    }
+
+    #[test]
+    fn compressed_versions_get_their_own_etag() {
+        let metadata = std::fs::metadata(".").unwrap();
+        let plain = file_validators(&metadata).unwrap();
+        let tagged = tag_with_encoding(plain.clone(), Encoding::Gzip);
+        assert_ne!(plain.etag, tagged.etag);
+        assert!(tagged.etag.starts_with('"') && tagged.etag.ends_with("-gzip\""));
+        assert_eq!(plain.last_modified, tagged.last_modified);
+    }
+
+    #[tokio::test]
+    async fn gzip_is_used_for_clients_that_accept_it() {
+        let site = TempSite::new("gzip");
+        write_script(&site);
+        let response = serve_with_config(&site_config(&site), &accepting("/app.js", "gzip")).await;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("gzip")
+        );
+        assert_eq!(
+            header_of(&response, "Vary").as_deref(),
+            Some("Accept-Encoding")
+        );
+        assert!(
+            header_of(&response, "Content-Type")
+                .unwrap()
+                .contains("javascript")
+        );
+
+        let etag = header_of(&response, "ETag").unwrap();
+        assert!(
+            etag.starts_with("W/\"") && etag.ends_with("-gzip\""),
+            "{etag}"
+        );
+
+        assert!(response.body.len() < script().len() / 4);
+        assert_eq!(response.content_length(), response.body.len() as u64);
+        assert_eq!(gunzip(&response.body), script().as_bytes());
+        // Byte ranges are not offered on the compressed version.
+        assert!(header_of(&response, "Accept-Ranges").is_none());
+    }
+
+    #[tokio::test]
+    async fn brotli_is_preferred_when_both_are_accepted() {
+        let site = TempSite::new("brotli");
+        write_script(&site);
+        let response =
+            serve_with_config(&site_config(&site), &accepting("/app.js", "gzip, br")).await;
+
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("br")
+        );
+        assert_eq!(unbrotli(&response.body), script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn clients_that_send_nothing_get_the_plain_file() {
+        let site = TempSite::new("plain");
+        write_script(&site);
+        let response = serve_with_config(&site_config(&site), &get("/app.js")).await;
+
+        assert_eq!(response.status, 200);
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert_eq!(response.body, script().as_bytes());
+        // Still "Vary", so caches never mix the versions up.
+        assert_eq!(
+            header_of(&response, "Vary").as_deref(),
+            Some("Accept-Encoding")
+        );
+        assert!(!header_of(&response, "ETag").unwrap().starts_with("W/"));
+    }
+
+    #[tokio::test]
+    async fn quality_values_are_respected() {
+        let site = TempSite::new("q-values");
+        write_script(&site);
+        let config = site_config(&site);
+
+        let response = serve_with_config(&config, &accepting("/app.js", "br;q=0, gzip")).await;
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("gzip")
+        );
+
+        let response = serve_with_config(&config, &accepting("/app.js", "gzip;q=0")).await;
+        assert!(header_of(&response, "Content-Encoding").is_none());
+    }
+
+    #[tokio::test]
+    async fn several_accept_encoding_headers_are_combined() {
+        let site = TempSite::new("two-headers");
+        write_script(&site);
+        let mut request = get("/app.js");
+        request
+            .headers
+            .push(("Accept-Encoding".to_string(), "identity".to_string()));
+        request
+            .headers
+            .push(("accept-encoding".to_string(), "gzip".to_string()));
+
+        let response = serve_with_config(&site_config(&site), &request).await;
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("gzip")
+        );
+    }
+
+    #[tokio::test]
+    async fn small_files_are_not_compressed() {
+        let site = TempSite::new("small-no-gzip");
+        let response =
+            serve_with_config(&site_config(&site), &accepting("/style.css", "gzip, br")).await;
+
+        assert_eq!(response.status, 200);
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert_eq!(response.body, b"body {}");
+    }
+
+    #[tokio::test]
+    async fn images_are_never_compressed() {
+        let site = TempSite::new("images");
+        // Zeros would compress wonderfully, so only the TYPE can stop us.
+        std::fs::write(site.root.join("photo.png"), vec![0u8; 2000]).unwrap();
+        let response =
+            serve_with_config(&site_config(&site), &accepting("/photo.png", "gzip, br")).await;
+
+        assert_eq!(response.status, 200);
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert!(header_of(&response, "Vary").is_none());
+        assert_eq!(response.content_length(), 2000);
+    }
+
+    #[tokio::test]
+    async fn files_above_the_size_limit_are_not_compressed_on_the_fly() {
+        let site = TempSite::new("too-big");
+        write_script(&site);
+        let config = Config {
+            compress_max_bytes: 1000,
+            ..site_config(&site)
+        };
+        let response = serve_with_config(&config, &accepting("/app.js", "gzip")).await;
+
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert_eq!(response.body, script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn compression_can_be_turned_off() {
+        let site = TempSite::new("disabled");
+        write_script(&site);
+        let config = Config {
+            compression: false,
+            ..site_config(&site)
+        };
+        let response = serve_with_config(&config, &accepting("/app.js", "gzip")).await;
+
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert!(header_of(&response, "Vary").is_none());
+        assert_eq!(response.body, script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn range_requests_get_the_original_bytes() {
+        let site = TempSite::new("range-not-compressed");
+        write_script(&site);
+        let request = get_with(
+            "/app.js",
+            &[("Accept-Encoding", "gzip"), ("Range", "bytes=0-9")],
+        );
+        let response = serve_with_config(&site_config(&site), &request).await;
+
+        assert_eq!(response.status, 206);
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert_eq!(
+            header_of(&response, "Content-Range"),
+            Some(format!("bytes 0-9/{}", script().len()))
+        );
+        assert_eq!(full_body(&response).await, &script().as_bytes()[..10]);
+    }
+
+    #[tokio::test]
+    async fn compressed_versions_revalidate_with_304() {
+        let site = TempSite::new("compressed-304");
+        write_script(&site);
+        let config = site_config(&site);
+
+        let first = serve_with_config(&config, &accepting("/app.js", "gzip")).await;
+        let etag = header_of(&first, "ETag").unwrap();
+
+        // The same client asks again with the tag it was given: not modified.
+        let request = get_with(
+            "/app.js",
+            &[
+                ("Accept-Encoding", "gzip"),
+                ("If-None-Match", etag.as_str()),
+            ],
+        );
+        let again = serve_with_config(&config, &request).await;
+        assert_eq!(again.status, 304);
+        assert!(again.body.is_empty());
+        assert_eq!(header_of(&again, "ETag"), Some(etag.clone()));
+        assert_eq!(
+            header_of(&again, "Vary").as_deref(),
+            Some("Accept-Encoding")
+        );
+
+        // A client that now wants the PLAIN file must not be told "not modified".
+        let plain = get_with("/app.js", &[("If-None-Match", etag.as_str())]);
+        let response = serve_with_config(&config, &plain).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn text_that_does_not_shrink_is_sent_as_it_is() {
+        let site = TempSite::new("incompressible");
+        let mut x: u32 = 12345;
+        let noise: Vec<u8> = (0..1000)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        std::fs::write(site.root.join("noise.txt"), &noise).unwrap();
+
+        let response =
+            serve_with_config(&site_config(&site), &accepting("/noise.txt", "gzip, br")).await;
+        assert_eq!(response.status, 200);
+        assert!(header_of(&response, "Content-Encoding").is_none());
+        assert_eq!(response.body, noise);
+        // The plain file keeps its plain (strong) ETag.
+        assert!(!header_of(&response, "ETag").unwrap().starts_with("W/"));
+    }
+
+    #[tokio::test]
+    async fn a_precompressed_copy_is_streamed_instead_of_compressing() {
+        let site = TempSite::new("precompressed");
+        write_script(&site);
+        // This copy unpacks to something DIFFERENT, so we can tell it was used.
+        let copy = compression::compress(Encoding::Gzip, b"PRECOMPRESSED").unwrap();
+        std::fs::write(site.root.join("app.js.gz"), &copy).unwrap();
+
+        let response = serve_with_config(&site_config(&site), &accepting("/app.js", "gzip")).await;
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("gzip")
+        );
+        assert!(response.file.is_some(), "it should be streamed from disk");
+        assert_eq!(gunzip(&full_body(&response).await), b"PRECOMPRESSED");
+        assert!(
+            header_of(&response, "Content-Type")
+                .unwrap()
+                .contains("javascript")
+        );
+
+        // A real file's exact bytes: a strong ETag.
+        let etag = header_of(&response, "ETag").unwrap();
+        assert!(etag.starts_with('"') && etag.ends_with("-gzip\""), "{etag}");
+    }
+
+    #[tokio::test]
+    async fn the_best_available_precompressed_copy_is_used() {
+        let site = TempSite::new("only-gz");
+        write_script(&site);
+        let copy = compression::compress(Encoding::Gzip, b"GZ ONLY").unwrap();
+        std::fs::write(site.root.join("app.js.gz"), &copy).unwrap();
+
+        // The client prefers brotli, but only a .gz copy exists: use it
+        // rather than compressing brotli on the fly.
+        let response =
+            serve_with_config(&site_config(&site), &accepting("/app.js", "br, gzip")).await;
+        assert_eq!(
+            header_of(&response, "Content-Encoding").as_deref(),
+            Some("gzip")
+        );
+        assert_eq!(gunzip(&full_body(&response).await), b"GZ ONLY");
+    }
+
+    #[tokio::test]
+    async fn a_stale_precompressed_copy_is_ignored() {
+        let site = TempSite::new("stale-copy");
+        write_script(&site);
+        let copy = compression::compress(Encoding::Gzip, b"STALE CONTENT").unwrap();
+        let copy_path = site.root.join("app.js.gz");
+        std::fs::write(&copy_path, &copy).unwrap();
+
+        // Make the copy older than the original.
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&copy_path)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(file);
+
+        let response = serve_with_config(&site_config(&site), &accepting("/app.js", "gzip")).await;
+        assert_eq!(response.status, 200);
+        // Compressed fresh from the real file instead.
+        assert!(header_of(&response, "ETag").unwrap().starts_with("W/"));
+        assert_eq!(gunzip(&response.body), script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn precompressed_copies_can_be_switched_off() {
+        let site = TempSite::new("copies-off");
+        write_script(&site);
+        let copy = compression::compress(Encoding::Gzip, b"SHOULD NOT BE USED").unwrap();
+        std::fs::write(site.root.join("app.js.gz"), &copy).unwrap();
+
+        let config = Config {
+            serve_precompressed: false,
+            ..site_config(&site)
+        };
+        let response = serve_with_config(&config, &accepting("/app.js", "gzip")).await;
+        assert_eq!(gunzip(&response.body), script().as_bytes());
+    }
+
+    #[tokio::test]
+    async fn cache_rules_choose_cache_control_by_extension() {
+        let site = TempSite::new("cache-rules");
+        let config = Config {
+            cache_rules: vec![CacheRule {
+                extensions: vec!["css".to_string(), "JS".to_string()],
+                cache_control: "public, max-age=3600".to_string(),
+            }],
+            ..site_config(&site)
+        };
+
+        let css = serve_with_config(&config, &get("/style.css")).await;
+        assert_eq!(
+            header_of(&css, "Cache-Control").as_deref(),
+            Some("public, max-age=3600")
+        );
+
+        let html = serve_with_config(&config, &get("/index.html")).await;
+        assert_eq!(
+            header_of(&html, "Cache-Control").as_deref(),
+            Some("no-cache")
+        );
+
+        // A 304 must carry the same caching rule as the 200 it replaces.
+        let etag = header_of(&css, "ETag").unwrap();
+        let request = get_with("/style.css", &[("If-None-Match", etag.as_str())]);
+        let revalidated = serve_with_config(&config, &request).await;
+        assert_eq!(revalidated.status, 304);
+        assert_eq!(
+            header_of(&revalidated, "Cache-Control").as_deref(),
+            Some("public, max-age=3600")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_default_sends_no_cache_control() {
+        let site = TempSite::new("no-cache-header");
+        let config = Config {
+            default_cache_control: String::new(),
+            ..site_config(&site)
+        };
+        let response = serve_with_config(&config, &get("/index.html")).await;
+        assert_eq!(response.status, 200);
+        assert!(header_of(&response, "Cache-Control").is_none());
     }
 }

@@ -380,7 +380,7 @@ where
                 if shared.router.knows_path(&request) {
                     shared.router.handle(&request)
                 } else if matches!(request.method, Method::Get | Method::Head) {
-                    static_files::serve(&config.document_root, &request).await
+                    static_files::serve_with_config(config, &request).await
                 } else {
                     shared.router.handle(&request)
                 }

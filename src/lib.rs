@@ -3,6 +3,7 @@
 //! The program in `main.rs` is a thin wrapper around this library. Keeping
 //! the real code here is what lets tests start real servers.
 
+pub mod compression;
 pub mod config;
 pub mod connection;
 pub mod handlers;

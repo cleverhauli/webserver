@@ -25,8 +25,8 @@ max_requests_per_connection = 100
 # ---------- HTTPS (optional) ----------
 # Uncomment both lines to turn HTTPS on. For local testing, make a
 # development certificate with:  cargo run --example gen_cert
-tls_cert_path = "certs/dev-cert.pem"
-tls_key_path = "certs/dev-key.pem"
+# tls_cert_path = "certs/dev-cert.pem"
+# tls_key_path = "certs/dev-key.pem"
 
 # The port HTTPS listens on. With HTTPS on, "port" above then redirects here.
 https_port = 8443
@@ -40,3 +40,30 @@ hsts_max_age_secs = 0
 
 # Seconds a client has to finish the TLS handshake.
 tls_handshake_timeout_secs = 10
+
+# ---------- Compression ----------
+# Compress text-like files (HTML, CSS, JavaScript, JSON, SVG...) for clients that ask.
+compression = true
+
+# Files smaller than this are not worth compressing.
+compress_min_bytes = 256
+
+# Files bigger than this are not compressed on the fly (they are held in memory
+# while compressing). Use precompressed copies for those.
+compress_max_bytes = 2097152
+
+# Use "app.js.br" and "app.js.gz" files next to the original when they exist
+# and are not older than it.
+serve_precompressed = true
+
+# ---------- Caching ----------
+# Cache-Control for files that match no rule below. "no-cache" means "you may
+# keep a copy, but ask me before using it", so edits show up at once.
+# Use an empty string ("") to send no Cache-Control header at all.
+default_cache_control = "no-cache"
+
+# Rules by file extension: the first matching rule wins. Uncomment to let
+# browsers reuse these files for an hour without asking.
+# cache_rules = [
+#   { extensions = ["css", "js", "svg", "png", "jpg", "gif", "webp", "woff2"], cache_control = "public, max-age=3600" },
+# ]
