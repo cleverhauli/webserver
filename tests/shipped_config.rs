@@ -21,6 +21,10 @@ fn the_shipped_config_works_on_a_fresh_checkout() {
         "cache rules must ship commented out, or edits will not show up while developing"
     );
     assert!(
+        config.proxy.is_empty(),
+        "config.toml must ship with the example proxy route commented out"
+    );
+    assert!(
         Path::new(&config.document_root).is_dir(),
         "the document root '{}' must exist in the repository",
         config.document_root

@@ -67,3 +67,20 @@ default_cache_control = "no-cache"
 # cache_rules = [
 #   { extensions = ["css", "js", "svg", "png", "jpg", "gif", "webp", "woff2"], cache_control = "public, max-age=3600" },
 # ]
+
+
+# ---------- Reverse proxy ----------
+# Seconds allowed for connecting to a proxied program.
+proxy_connect_timeout_secs = 5
+
+# The largest response accepted from a proxied program. It is held in memory,
+# so keep it modest. Bigger responses get "502 Bad Gateway".
+proxy_max_response_bytes = 16777216
+
+# Forward some paths to another program: one [[proxy]] block per route.
+# Keep these blocks at the END of this file.
+# [[proxy]]
+# prefix = "/api"                # "/api" and "/api/..." are forwarded
+# upstream = "127.0.0.1:3000"    # host:port of the other program
+# strip_prefix = true            # "/api/users" reaches the upstream as "/users"
+# timeout_secs = 30              # how long the upstream has to answer

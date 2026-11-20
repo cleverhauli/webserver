@@ -9,6 +9,7 @@ use crate::http::parser::ParseError;
 use crate::http::request::Method;
 use crate::http::response::{FileSlice, Response};
 use crate::net_util::{is_routine_disconnect, write_all_timeout};
+use crate::proxy::{self, ClientInfo};
 use crate::redirect::https_redirect;
 use crate::router::Router;
 use crate::static_files;
@@ -248,7 +249,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             // Holding the permit until this task ends keeps the slot taken.
             let _permit = permit;
-            if let Err(e) = serve_connection(stream, kind, shared, stop).await {
+            if let Err(e) = serve_connection(stream, addr, kind, shared, stop).await {
                 if is_routine_disconnect(&e) {
                     debug!("{addr}: connection ended early: {e}");
                 } else {
@@ -270,22 +271,23 @@ async fn refuse_busy(mut stream: TcpStream, write_timeout: Duration) {
 /// serve the connection.
 async fn serve_connection(
     stream: TcpStream,
+    peer: SocketAddr,
     kind: Listener,
     shared: Arc<Shared>,
     stop: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     match kind {
         Listener::Http => {
-            handle_connection(stream, &shared, Mode::Site { secure: false }, stop).await
+            handle_connection(stream, peer, &shared, Mode::Site { secure: false }, stop).await
         }
         Listener::Redirect { https_port } => {
-            handle_connection(stream, &shared, Mode::Redirect { https_port }, stop).await
+            handle_connection(stream, peer, &shared, Mode::Redirect { https_port }, stop).await
         }
         Listener::Https(acceptor) => {
             let handshake_limit = Duration::from_secs(shared.config.tls_handshake_timeout_secs);
             match tokio::time::timeout(handshake_limit, acceptor.accept(stream)).await {
                 Ok(Ok(tls)) => {
-                    handle_connection(tls, &shared, Mode::Site { secure: true }, stop).await
+                    handle_connection(tls, peer, &shared, Mode::Site { secure: true }, stop).await
                 }
                 // Scanners and plain-HTTP clients hitting the HTTPS port are common.
                 Ok(Err(e)) => {
@@ -304,6 +306,7 @@ async fn serve_connection(
 /// Serve one connection (plain or TLS), then say goodbye properly.
 async fn handle_connection<S>(
     mut stream: S,
+    peer: SocketAddr,
     shared: &Shared,
     mode: Mode,
     mut stop: watch::Receiver<bool>,
@@ -311,7 +314,7 @@ async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let result = request_loop(&mut stream, shared, mode, &mut stop).await;
+    let result = request_loop(&mut stream, peer, shared, mode, &mut stop).await;
 
     // For TLS this sends "close_notify", which tells the client "I finished
     // on purpose", as opposed to "the connection was cut off".
@@ -323,6 +326,7 @@ where
 /// Serve requests on one connection until it should close.
 async fn request_loop<S>(
     stream: &mut S,
+    peer: SocketAddr,
     shared: &Shared,
     mode: Mode,
     stop: &mut watch::Receiver<bool>,
@@ -374,10 +378,15 @@ where
 
         let mut response = match mode {
             Mode::Redirect { https_port } => https_redirect(&request, https_port),
-            Mode::Site { .. } => {
-                // A registered route wins. Otherwise GET and HEAD requests
-                // look for a file in the document root.
-                if shared.router.knows_path(&request) {
+            Mode::Site { secure } => {
+                // 1. A proxy route. 2. A registered route. 3. A file.
+                if let Some(route) = proxy::find_route(&config.proxy, &request.target) {
+                    let client = ClientInfo {
+                        ip: peer.ip(),
+                        secure,
+                    };
+                    proxy::forward(&request, route, &client, config).await
+                } else if shared.router.knows_path(&request) {
                     shared.router.handle(&request)
                 } else if matches!(request.method, Method::Get | Method::Head) {
                     static_files::serve_with_config(config, &request).await

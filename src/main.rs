@@ -75,6 +75,12 @@ async fn main() -> std::io::Result<()> {
         "Keep-alive: {}s idle wait, up to {} requests per connection",
         config.keep_alive_timeout_secs, config.max_requests_per_connection
     );
+    for route in &config.proxy {
+        info!(
+            "Proxy: {} -> {} ({}s timeout)",
+            route.prefix, route.upstream, route.timeout_secs
+        );
+    }
     let redirecting = config.tls_enabled() && config.redirect_http_to_https;
     let hsts = config.hsts_max_age_secs;
 

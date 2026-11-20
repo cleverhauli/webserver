@@ -77,7 +77,7 @@ fn is_reserved_windows_name(segment: &str) -> bool {
 
 /// Decode "%41" style escapes. Returns `None` for broken escapes or
 /// results that are not valid UTF-8 text.
-fn percent_decode(input: &str) -> Option<String> {
+pub(crate) fn percent_decode(input: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

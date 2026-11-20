@@ -3,10 +3,21 @@ pub fn reason_phrase(code: u16) -> &'static str {
     match code {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
         204 => "No Content",
         206 => "Partial Content",
         301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
+        307 => "Temporary Redirect",
+        401 => "Unauthorized",
+        406 => "Not Acceptable",
+        409 => "Conflict",
+        410 => "Gone",
+        412 => "Precondition Failed",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Content",
+        429 => "Too Many Requests",
         304 => "Not Modified",
         308 => "Permanent Redirect",
         400 => "Bad Request",
@@ -42,5 +53,12 @@ mod tests {
     #[test]
     fn unknown_codes_do_not_crash() {
         assert_eq!(reason_phrase(999), "Unknown");
+    }
+
+    #[test]
+    fn common_application_statuses_have_names() {
+        assert_eq!(reason_phrase(401), "Unauthorized");
+        assert_eq!(reason_phrase(409), "Conflict");
+        assert_eq!(reason_phrase(429), "Too Many Requests");
     }
 }

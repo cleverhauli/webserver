@@ -17,6 +17,89 @@ fn is_plain_header_text(text: &str) -> bool {
     text.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
 }
 
+/// One reverse-proxy route: requests whose path starts with `prefix` are
+/// forwarded to the program listening at `upstream`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyRoute {
+    /// The path to forward, like "/api". It matches "/api" and "/api/...",
+    /// but not "/apix".
+    pub prefix: String,
+    /// Where to forward to, as "host:port", like "127.0.0.1:3000".
+    pub upstream: String,
+    /// Remove the prefix first: "/api/users" is sent to the upstream as "/users".
+    pub strip_prefix: bool,
+    /// How many seconds the upstream has to answer.
+    pub timeout_secs: u64,
+}
+
+impl Default for ProxyRoute {
+    fn default() -> Self {
+        ProxyRoute {
+            prefix: String::new(),
+            upstream: String::new(),
+            strip_prefix: true,
+            timeout_secs: 30,
+        }
+    }
+}
+
+impl ProxyRoute {
+    fn validate(&self) -> Result<(), String> {
+        let prefix = &self.prefix;
+        let valid_prefix = prefix.starts_with('/')
+            && prefix.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~')
+            })
+            && (prefix == "/" || !prefix.ends_with('/'))
+            && !prefix.contains("//")
+            && !prefix
+                .split('/')
+                .any(|segment| segment == ".." || segment == ".");
+        if !valid_prefix {
+            return Err(format!(
+                "invalid proxy prefix '{prefix}': it must start with '/', use only letters, digits and - _ . ~ /, and not end with '/' (except '/' on its own)"
+            ));
+        }
+        if !is_valid_upstream(&self.upstream) {
+            return Err(format!(
+                "invalid proxy upstream '{}': use host:port, like 127.0.0.1:3000",
+                self.upstream
+            ));
+        }
+        if self.timeout_secs == 0 || self.timeout_secs > 3600 {
+            return Err(format!(
+                "the proxy timeout_secs for '{prefix}' must be between 1 and 3600"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// "host:port" where host is a name, an IPv4 address or a bracketed IPv6 address.
+fn is_valid_upstream(upstream: &str) -> bool {
+    let Some((host, port)) = upstream.rsplit_once(':') else {
+        return false;
+    };
+    let port_ok = !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|p| p != 0);
+    let host_ok = if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        !inner.is_empty()
+            && inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+    } else {
+        !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    };
+    port_ok && host_ok
+}
+
 /// All server settings. Any setting missing from the file gets a default.
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -55,6 +138,12 @@ pub struct Config {
     pub default_cache_control: String,
     /// Cache-Control rules by file extension. The first matching rule wins.
     pub cache_rules: Vec<CacheRule>,
+    /// Paths forwarded to other programs. See the [[proxy]] blocks in config.toml.
+    pub proxy: Vec<ProxyRoute>,
+    /// Seconds allowed for connecting to a proxied program.
+    pub proxy_connect_timeout_secs: u64,
+    /// The largest response accepted from a proxied program (held in memory).
+    pub proxy_max_response_bytes: usize,
     pub max_connections: usize,
 }
 
@@ -83,6 +172,9 @@ impl Default for Config {
             serve_precompressed: true,
             default_cache_control: "no-cache".to_string(),
             cache_rules: Vec::new(),
+            proxy: Vec::new(),
+            proxy_connect_timeout_secs: 5,
+            proxy_max_response_bytes: 16 * 1024 * 1024,
             max_connections: 1000,
         }
     }
@@ -202,6 +294,23 @@ impl Config {
                         .to_string(),
                 );
             }
+        }
+        if self.proxy_connect_timeout_secs == 0 {
+            return Err("proxy_connect_timeout_secs must be at least 1".to_string());
+        }
+        if self.proxy_max_response_bytes == 0 || self.proxy_max_response_bytes > 256 * 1024 * 1024 {
+            return Err(
+                "proxy_max_response_bytes must be between 1 and 268435456 (256 MiB), because responses are held in memory"
+                    .to_string(),
+            );
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for route in &self.proxy {
+            route.validate()?;
+            if seen.contains(&route.prefix.as_str()) {
+                return Err(format!("the proxy prefix '{}' is used twice", route.prefix));
+            }
+            seen.push(route.prefix.as_str());
         }
         Ok(())
     }
@@ -387,6 +496,114 @@ cache_rules = [
             r#"cache_rules = [{ extensions = ["css"], cache_control = "a\r\nSet-Cookie: x=1" }]"#,
             "compress_min_bytes = 100\ncompress_max_bytes = 50",
             "compress_max_bytes = 999999999999",
+        ] {
+            assert!(
+                Config::from_toml_str(text).is_err(),
+                "should reject: {text}"
+            );
+        }
+    }
+
+    const PROXY: &str = r#"
+[[proxy]]
+prefix = "/api"
+upstream = "127.0.0.1:3000"
+
+[[proxy]]
+prefix = "/api/v2"
+upstream = "localhost:4000"
+strip_prefix = false
+timeout_secs = 5
+"#;
+
+    #[test]
+    fn there_are_no_proxy_routes_by_default() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(config.proxy.is_empty());
+        assert_eq!(config.proxy_connect_timeout_secs, 5);
+        assert_eq!(config.proxy_max_response_bytes, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn proxy_routes_are_read_from_toml() {
+        let config = Config::from_toml_str(PROXY).unwrap();
+        assert_eq!(config.proxy.len(), 2);
+
+        // Unset values get their defaults.
+        assert_eq!(config.proxy[0].prefix, "/api");
+        assert_eq!(config.proxy[0].upstream, "127.0.0.1:3000");
+        assert!(config.proxy[0].strip_prefix);
+        assert_eq!(config.proxy[0].timeout_secs, 30);
+
+        assert_eq!(config.proxy[1].upstream, "localhost:4000");
+        assert!(!config.proxy[1].strip_prefix);
+        assert_eq!(config.proxy[1].timeout_secs, 5);
+    }
+
+    #[test]
+    fn good_upstream_addresses_are_accepted() {
+        for upstream in [
+            "127.0.0.1:3000",
+            "localhost:4000",
+            "[::1]:3000",
+            "my-app.internal:8080",
+        ] {
+            let text = format!("[[proxy]]\nprefix = \"/api\"\nupstream = \"{upstream}\"");
+            assert!(
+                Config::from_toml_str(&text).is_ok(),
+                "should accept {upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_proxy_routes_are_rejected() {
+        for (prefix, upstream) in [
+            ("api", "127.0.0.1:3000"),
+            ("/api/", "127.0.0.1:3000"),
+            ("//api", "127.0.0.1:3000"),
+            ("/a/../b", "127.0.0.1:3000"),
+            ("/a b", "127.0.0.1:3000"),
+            ("/ap%69", "127.0.0.1:3000"),
+            ("", "127.0.0.1:3000"),
+            ("/api", ""),
+            ("/api", "localhost"),
+            ("/api", "localhost:0"),
+            ("/api", "localhost:99999"),
+            ("/api", "a b:80"),
+            ("/api", "http://x:80"),
+            ("/api", "[::1:80"),
+            ("/api", "evil.com/path:80"),
+        ] {
+            let text = format!("[[proxy]]\nprefix = \"{prefix}\"\nupstream = \"{upstream}\"");
+            assert!(
+                Config::from_toml_str(&text).is_err(),
+                "should reject {prefix:?} -> {upstream:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_root_prefix_is_allowed() {
+        let text = "[[proxy]]\nprefix = \"/\"\nupstream = \"127.0.0.1:3000\"";
+        assert!(Config::from_toml_str(text).is_ok());
+    }
+
+    #[test]
+    fn other_bad_proxy_settings_are_rejected() {
+        for text in [
+            // missing upstream
+            "[[proxy]]\nprefix = \"/api\"",
+            // timeouts out of range
+            "[[proxy]]\nprefix = \"/api\"\nupstream = \"a:80\"\ntimeout_secs = 0",
+            "[[proxy]]\nprefix = \"/api\"\nupstream = \"a:80\"\ntimeout_secs = 3601",
+            // a misspelt setting must not be silently ignored
+            "[[proxy]]\nprefix = \"/api\"\nupstream = \"a:80\"\nstripprefix = false",
+            // the same prefix twice
+            "[[proxy]]\nprefix = \"/api\"\nupstream = \"a:80\"\n[[proxy]]\nprefix = \"/api\"\nupstream = \"b:80\"",
+            "proxy_connect_timeout_secs = 0",
+            "proxy_max_response_bytes = 0",
+            "proxy_max_response_bytes = 999999999999",
         ] {
             assert!(
                 Config::from_toml_str(text).is_err(),

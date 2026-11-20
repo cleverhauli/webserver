@@ -296,3 +296,109 @@ pub async fn tls_exchange(addr: SocketAddr, connector: &TlsConnector, request: &
     stream.write_all(request).await.unwrap();
     read_until_closed(&mut stream).await
 }
+
+// ---------- a fake upstream program, for the proxy tests ----------
+
+/// A tiny server that records the requests it receives and answers with
+/// whatever a closure decides. The closure returns `Some(bytes)` to send
+/// those bytes and then hang up, or `None` to say nothing and keep the
+/// connection open.
+pub struct FakeUpstream {
+    pub addr: SocketAddr,
+    requests: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    task: JoinHandle<()>,
+}
+
+impl FakeUpstream {
+    pub async fn start(
+        responder: impl Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
+    ) -> FakeUpstream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder = Arc::new(responder);
+
+        let recorded = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = Arc::clone(&recorded);
+                let responder = Arc::clone(&responder);
+                tokio::spawn(async move {
+                    let request = read_one_request(&mut stream).await;
+                    recorded.lock().unwrap().push(request.clone());
+                    match responder(&request) {
+                        Some(answer) => {
+                            let _ = stream.write_all(&answer).await;
+                            let _ = stream.shutdown().await;
+                        }
+                        None => {
+                            // Say nothing, and keep the connection open.
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        FakeUpstream {
+            addr,
+            requests,
+            task,
+        }
+    }
+
+    /// Every request received so far, as text.
+    pub fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+            .collect()
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for FakeUpstream {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Read one request: the headers, then as many body bytes as Content-Length says.
+async fn read_one_request(stream: &mut TcpStream) -> Vec<u8> {
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..end]).to_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if data.len() >= end + 4 + length {
+                break;
+            }
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => data.extend_from_slice(&chunk[..n]),
+        }
+    }
+    data
+}
+
+/// An address where nothing is listening (a port that was free a moment ago).
+pub fn free_address() -> SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}

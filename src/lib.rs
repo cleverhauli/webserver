@@ -9,6 +9,7 @@ pub mod connection;
 pub mod handlers;
 pub mod http;
 pub mod net_util;
+pub mod proxy;
 pub mod redirect;
 pub mod router;
 pub mod server;

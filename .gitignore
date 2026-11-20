@@ -6,3 +6,6 @@
 /certs
 *.pem
 *.key
+/upstream-site
+/upstream.toml
+/upstream-server.exe
