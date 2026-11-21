@@ -1,5 +1,6 @@
 use clap::Parser;
-use tracing::{error, info};
+use std::path::Path;
+use tracing::{error, info, warn};
 use webserver::config::Config;
 use webserver::server::Server;
 
@@ -14,6 +15,11 @@ struct Args {
     /// Override the port from the config file
     #[arg(long)]
     port: Option<u16>,
+
+    /// Check the config file (and the files it points to), report every
+    /// problem found, and exit without starting the server
+    #[arg(long)]
+    check_config: bool,
 }
 
 /// Completes when the user asks the server to stop: Ctrl+C everywhere,
@@ -50,7 +56,7 @@ async fn main() -> std::io::Result<()> {
 
     let args = Args::parse();
 
-    let mut config = match Config::load(&args.config) {
+    let mut config = match Config::load_unchecked(&args.config) {
         Ok(config) => config,
         Err(message) => {
             error!("{message}");
@@ -61,11 +67,32 @@ async fn main() -> std::io::Result<()> {
     if let Some(port) = args.port {
         config.port = port;
     }
-    if let Err(message) = config.validate() {
-        error!("invalid settings: {message}");
+
+    // Report EVERY problem at once, not just the first one.
+    let mut problems = config.problems();
+    if args.check_config {
+        problems.extend(config.environment_problems());
+    }
+    if !problems.is_empty() {
+        for problem in &problems {
+            error!("{problem}");
+        }
+        error!("{} problem(s) found in '{}'", problems.len(), args.config);
         std::process::exit(1);
     }
+    if args.check_config {
+        info!("Configuration '{}' is OK", args.config);
+        return Ok(());
+    }
 
+    if !Path::new(&config.document_root).is_dir() {
+        warn!(
+            "document root '{}' is not a folder: every file request will get 404",
+            config.document_root
+        );
+    }
+
+    let address = config.address();
     info!("Serving files from '{}'", config.document_root);
     info!(
         "Limits: {} connections, {}s to send a request, {}s write timeout",
@@ -80,6 +107,15 @@ async fn main() -> std::io::Result<()> {
             "Proxy: {} -> {} ({}s timeout)",
             route.prefix, route.upstream, route.timeout_secs
         );
+    }
+    if config.status_page {
+        info!(
+            "Status page: http://{address}/status (allowed: {})",
+            config.status_allowed_ips.join(", ")
+        );
+    }
+    if !config.access_log {
+        info!("Access log is off");
     }
     let redirecting = config.tls_enabled() && config.redirect_http_to_https;
     let hsts = config.hsts_max_age_secs;

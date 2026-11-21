@@ -68,6 +68,21 @@ default_cache_control = "no-cache"
 #   { extensions = ["css", "js", "svg", "png", "jpg", "gif", "webp", "woff2"], cache_control = "public, max-age=3600" },
 # ]
 
+# ---------- Logging and monitoring ----------
+# Write one log line per request (log target "access").
+# To silence it:  set RUST_LOG=info,access=off
+access_log = true
+
+# Include the query string ("?x=1") in access logs. Off by default, because
+# query strings often hold passwords, tokens or personal data.
+log_query_strings = false
+
+# A page at /status with counters, as JSON. Off by default.
+status_page = false
+
+# Who may see it: exact addresses only. A request that came through another
+# proxy (it carries X-Forwarded-For) is always refused, even from these.
+status_allowed_ips = ["127.0.0.1", "::1"]
 
 # ---------- Reverse proxy ----------
 # Seconds allowed for connecting to a proxied program.

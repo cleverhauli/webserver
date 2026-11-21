@@ -25,6 +25,14 @@ fn the_shipped_config_works_on_a_fresh_checkout() {
         "config.toml must ship with the example proxy route commented out"
     );
     assert!(
+        !config.status_page,
+        "the status page must ship switched off"
+    );
+    assert!(
+        !config.log_query_strings,
+        "query strings must not be logged by default: they can hold secrets"
+    );
+    assert!(
         Path::new(&config.document_root).is_dir(),
         "the document root '{}' must exist in the repository",
         config.document_root

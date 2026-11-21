@@ -8,17 +8,20 @@ use crate::handlers;
 use crate::http::parser::ParseError;
 use crate::http::request::Method;
 use crate::http::response::{FileSlice, Response};
+use crate::logging::{loggable_target, sanitize_for_log};
+use crate::metrics::Metrics;
 use crate::net_util::{is_routine_disconnect, write_all_timeout};
 use crate::proxy::{self, ClientInfo};
 use crate::redirect::https_redirect;
 use crate::router::Router;
 use crate::static_files;
+use crate::status;
 use crate::tls::build_acceptor;
 use std::future::Future;
 use std::io::SeekFrom;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
@@ -59,6 +62,7 @@ struct Shared {
     config: Config,
     router: Router,
     limiter: Arc<Semaphore>,
+    metrics: Metrics,
 }
 
 /// A web server that is listening, but not yet serving requests.
@@ -69,6 +73,7 @@ pub struct Server {
     config: Config,
     router: Router,
     limiter: Arc<Semaphore>,
+    metrics: Metrics,
 }
 
 impl Server {
@@ -103,6 +108,7 @@ impl Server {
             https,
             limiter: Arc::new(Semaphore::new(config.max_connections)),
             router: build_router(),
+            metrics: Metrics::new(),
             config,
         })
     }
@@ -133,6 +139,7 @@ impl Server {
             config,
             router,
             limiter,
+            metrics,
         } = self;
 
         let grace = Duration::from_secs(config.shutdown_grace_secs);
@@ -141,6 +148,7 @@ impl Server {
             config,
             router,
             limiter: Arc::clone(&limiter),
+            metrics,
         });
 
         // A one-value broadcast: false while running, true once we are stopping.
@@ -229,11 +237,13 @@ async fn accept_loop(
             }
         };
         debug!("New connection from {addr}");
+        shared.metrics.connection_accepted();
 
         let permit = match Arc::clone(&shared.limiter).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
                 warn!("connection limit reached, refusing {addr}");
+                shared.metrics.connection_refused();
                 // Only plain HTTP can be told "503". A TLS client needs a
                 // handshake first, so it is simply dropped.
                 if !matches!(kind, Listener::Https(_)) {
@@ -292,10 +302,12 @@ async fn serve_connection(
                 // Scanners and plain-HTTP clients hitting the HTTPS port are common.
                 Ok(Err(e)) => {
                     debug!("TLS handshake failed: {e}");
+                    shared.metrics.tls_handshake_failed();
                     Ok(())
                 }
                 Err(_) => {
                     debug!("TLS handshake timed out");
+                    shared.metrics.tls_handshake_failed();
                     Ok(())
                 }
             }
@@ -368,24 +380,38 @@ where
             // After an error we no longer trust where the next request
             // would start, so we always close.
             Incoming::Failed(Failure::Parse(e)) => {
+                shared.metrics.request_rejected();
                 return reject(stream, e, write_timeout).await;
             }
             Incoming::Failed(Failure::TimedOut) => {
+                shared.metrics.request_timed_out();
                 return request_timeout(stream, write_timeout).await;
             }
         };
         served += 1;
+        let started = Instant::now();
 
+        let mut proxied = false;
         let mut response = match mode {
             Mode::Redirect { https_port } => https_redirect(&request, https_port),
             Mode::Site { secure } => {
-                // 1. A proxy route. 2. A registered route. 3. A file.
+                let active = config
+                    .max_connections
+                    .saturating_sub(shared.limiter.available_permits());
+
+                // 1. A proxy route. 2. The status page. 3. A registered
+                // route. 4. A file.
                 if let Some(route) = proxy::find_route(&config.proxy, &request.target) {
+                    proxied = true;
                     let client = ClientInfo {
                         ip: peer.ip(),
                         secure,
                     };
                     proxy::forward(&request, route, &client, config).await
+                } else if let Some(page) =
+                    status::handle(&request, peer.ip(), config, &shared.metrics, active)
+                {
+                    page
                 } else if shared.router.knows_path(&request) {
                     shared.router.handle(&request)
                 } else if matches!(request.method, Method::Get | Method::Head) {
@@ -411,15 +437,38 @@ where
             && !*stop.borrow();
         response.keep_alive = keep_open;
 
-        info!(
-            "[{scheme}] {} {} -> {}",
-            request.method.as_str(),
-            request.target,
-            response.status
-        );
-
+        let status_code = response.status;
         let include_body = request.method != Method::Head;
-        let sent_cleanly = send(stream, response, include_body, write_timeout).await?;
+        let body_bytes = if include_body {
+            response.content_length()
+        } else {
+            0
+        };
+
+        // Counted BEFORE sending, so a client that reads the status page right
+        // after getting its answer always sees that answer counted.
+        shared
+            .metrics
+            .request_served(status_code, body_bytes, proxied);
+
+        let sent = send(stream, response, include_body, write_timeout).await;
+
+        if config.access_log {
+            info!(
+                target: "access",
+                ip = %peer.ip(),
+                scheme,
+                method = request.method.as_str(),
+                path = ?loggable_target(&request.target, config.log_query_strings),
+                status = status_code,
+                bytes = body_bytes,
+                ms = started.elapsed().as_millis() as u64,
+                agent = ?sanitize_for_log(request.header("user-agent").unwrap_or("-"), 100),
+                complete = sent.is_ok(),
+            );
+        }
+
+        let sent_cleanly = sent?;
         if !keep_open || !sent_cleanly {
             return Ok(());
         }

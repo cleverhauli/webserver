@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 
 /// One caching rule: files with these extensions get this Cache-Control value.
@@ -144,6 +145,14 @@ pub struct Config {
     pub proxy_connect_timeout_secs: u64,
     /// The largest response accepted from a proxied program (held in memory).
     pub proxy_max_response_bytes: usize,
+    /// Write one log line per request (log target "access").
+    pub access_log: bool,
+    /// Include "?query=strings" in the access log. Off by default.
+    pub log_query_strings: bool,
+    /// Serve a /status page with counters.
+    pub status_page: bool,
+    /// The addresses allowed to see it. Exact addresses only.
+    pub status_allowed_ips: Vec<String>,
     pub max_connections: usize,
 }
 
@@ -175,24 +184,201 @@ impl Default for Config {
             proxy: Vec::new(),
             proxy_connect_timeout_secs: 5,
             proxy_max_response_bytes: 16 * 1024 * 1024,
+            access_log: true,
+            log_query_strings: false,
+            status_page: false,
+            status_allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
             max_connections: 1000,
         }
     }
 }
 
 impl Config {
-    /// Read and check a config file.
+    /// Read a config file and check every value.
     pub fn load(path: &str) -> Result<Config, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|e| format!("could not read config file '{path}': {e}"))?;
-        Config::from_toml_str(&text)
-    }
-
-    /// Parse config text. Separate from `load` so we can test it easily.
-    pub fn from_toml_str(text: &str) -> Result<Config, String> {
-        let config: Config = toml::from_str(text).map_err(|e| format!("invalid config: {e}"))?;
+        let config = Config::load_unchecked(path)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Read and parse a config file WITHOUT checking the values, so the
+    /// caller can report every problem at once with `problems()`.
+    pub fn load_unchecked(path: &str) -> Result<Config, String> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("could not read config file '{path}': {e}"))?;
+        Config::parse_toml(&text)
+    }
+
+    /// Parse config text and check every value. Separate from `load` so
+    /// we can test it easily.
+    pub fn from_toml_str(text: &str) -> Result<Config, String> {
+        let config = Config::parse_toml(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn parse_toml(text: &str) -> Result<Config, String> {
+        toml::from_str(text).map_err(|e| format!("invalid config: {e}"))
+    }
+
+    /// Check the values, stopping at the first problem.
+    pub fn validate(&self) -> Result<(), String> {
+        let problems = self.problems();
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// Every problem with these settings, all at once (empty when all is well).
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if self.port == 0 {
+            problems.push("port must not be 0".to_string());
+        }
+        if self.max_connections == 0 {
+            problems.push("max_connections must be at least 1".to_string());
+        }
+        if self.max_requests_per_connection == 0 {
+            problems.push("max_requests_per_connection must be at least 1".to_string());
+        }
+        for (name, value) in [
+            ("read_timeout_secs", self.read_timeout_secs),
+            ("write_timeout_secs", self.write_timeout_secs),
+            ("keep_alive_timeout_secs", self.keep_alive_timeout_secs),
+            ("shutdown_grace_secs", self.shutdown_grace_secs),
+            (
+                "tls_handshake_timeout_secs",
+                self.tls_handshake_timeout_secs,
+            ),
+            (
+                "proxy_connect_timeout_secs",
+                self.proxy_connect_timeout_secs,
+            ),
+        ] {
+            if value == 0 {
+                problems.push(format!("{name} must be at least 1"));
+            }
+        }
+
+        // HTTPS
+        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
+            problems.push("tls_cert_path and tls_key_path must be set together".to_string());
+        }
+        if self.tls_enabled() {
+            if self.https_port == 0 {
+                problems.push("https_port must not be 0".to_string());
+            }
+            if self.https_port == self.port {
+                problems.push("https_port must be different from port".to_string());
+            }
+        } else if self.hsts_max_age_secs > 0 {
+            problems.push(
+                "hsts_max_age_secs needs HTTPS (set tls_cert_path and tls_key_path)".to_string(),
+            );
+        }
+
+        // Compression
+        if self.compress_min_bytes > self.compress_max_bytes {
+            problems
+                .push("compress_min_bytes must not be larger than compress_max_bytes".to_string());
+        }
+        if self.compress_max_bytes > 64 * 1024 * 1024 {
+            problems.push(
+                "compress_max_bytes must be at most 67108864 (64 MiB), because files are held in memory while they are compressed"
+                    .to_string(),
+            );
+        }
+
+        // Caching
+        if !is_plain_header_text(&self.default_cache_control) {
+            problems.push(
+                "default_cache_control may only contain printable ASCII characters".to_string(),
+            );
+        }
+        for rule in &self.cache_rules {
+            if rule.extensions.is_empty() {
+                problems.push("every cache rule needs at least one extension".to_string());
+            }
+            for extension in &rule.extensions {
+                if extension.is_empty() || !extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    problems.push(format!(
+                        "invalid extension '{extension}' in a cache rule: use letters and digits only, without a dot"
+                    ));
+                }
+            }
+            if rule.cache_control.trim().is_empty() || !is_plain_header_text(&rule.cache_control) {
+                problems.push(
+                    "every cache rule needs a cache_control value made of printable ASCII characters"
+                        .to_string(),
+                );
+            }
+        }
+
+        // Reverse proxy
+        if self.proxy_max_response_bytes == 0 || self.proxy_max_response_bytes > 256 * 1024 * 1024 {
+            problems.push(
+                "proxy_max_response_bytes must be between 1 and 268435456 (256 MiB), because responses are held in memory"
+                    .to_string(),
+            );
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for route in &self.proxy {
+            if let Err(message) = route.validate() {
+                problems.push(message);
+            }
+            if seen.contains(&route.prefix.as_str()) {
+                problems.push(format!("the proxy prefix '{}' is used twice", route.prefix));
+            }
+            seen.push(route.prefix.as_str());
+        }
+
+        // Status page
+        if self.status_page && self.status_allowed_ips.is_empty() {
+            problems
+                .push("status_allowed_ips must not be empty when status_page is on".to_string());
+        }
+        for address in &self.status_allowed_ips {
+            if address.parse::<IpAddr>().is_err() {
+                problems.push(format!(
+                    "invalid address '{address}' in status_allowed_ips: use exact addresses like 127.0.0.1 or ::1"
+                ));
+            }
+        }
+
+        problems
+    }
+
+    /// May this address see the status page?
+    pub fn status_ip_allowed(&self, ip: IpAddr) -> bool {
+        // "::ffff:127.0.0.1" and "127.0.0.1" are the same machine.
+        let ip = ip.to_canonical();
+        self.status_allowed_ips
+            .iter()
+            .filter_map(|text| text.parse::<IpAddr>().ok())
+            .any(|allowed| allowed.to_canonical() == ip)
+    }
+
+    /// Problems that only show up when you look at the machine: a missing
+    /// folder, an unreadable certificate.
+    pub fn environment_problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+
+        if !Path::new(&self.document_root).is_dir() {
+            problems.push(format!(
+                "document_root '{}' is not a folder",
+                self.document_root
+            ));
+        }
+        if let (Some(cert), Some(key)) = (&self.tls_cert_path, &self.tls_key_path)
+            && let Err(message) = crate::tls::build_acceptor(cert, key)
+        {
+            problems.push(message);
+        }
+
+        problems
     }
 
     /// Is HTTPS turned on?
@@ -219,100 +405,6 @@ impl Config {
             }
         }
         &self.default_cache_control
-    }
-
-    pub fn validate(&self) -> Result<(), String> {
-        if self.port == 0 {
-            return Err("port must not be 0".to_string());
-        }
-        if self.max_connections == 0 {
-            return Err("max_connections must be at least 1".to_string());
-        }
-        if self.read_timeout_secs == 0 {
-            return Err("read_timeout_secs must be at least 1".to_string());
-        }
-        if self.write_timeout_secs == 0 {
-            return Err("write_timeout_secs must be at least 1".to_string());
-        }
-        if self.keep_alive_timeout_secs == 0 {
-            return Err("keep_alive_timeout_secs must be at least 1".to_string());
-        }
-        if self.max_requests_per_connection == 0 {
-            return Err("max_requests_per_connection must be at least 1".to_string());
-        }
-        if self.shutdown_grace_secs == 0 {
-            return Err("shutdown_grace_secs must be at least 1".to_string());
-        }
-        if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
-            return Err("tls_cert_path and tls_key_path must be set together".to_string());
-        }
-        if self.tls_handshake_timeout_secs == 0 {
-            return Err("tls_handshake_timeout_secs must be at least 1".to_string());
-        }
-        if self.tls_enabled() {
-            if self.https_port == 0 {
-                return Err("https_port must not be 0".to_string());
-            }
-            if self.https_port == self.port {
-                return Err("https_port must be different from port".to_string());
-            }
-        } else if self.hsts_max_age_secs > 0 {
-            return Err(
-                "hsts_max_age_secs needs HTTPS (set tls_cert_path and tls_key_path)".to_string(),
-            );
-        }
-        if self.compress_min_bytes > self.compress_max_bytes {
-            return Err(
-                "compress_min_bytes must not be larger than compress_max_bytes".to_string(),
-            );
-        }
-        if self.compress_max_bytes > 64 * 1024 * 1024 {
-            return Err(
-                "compress_max_bytes must be at most 67108864 (64 MiB), because files are held in memory while they are compressed"
-                    .to_string(),
-            );
-        }
-        if !is_plain_header_text(&self.default_cache_control) {
-            return Err(
-                "default_cache_control may only contain printable ASCII characters".to_string(),
-            );
-        }
-        for rule in &self.cache_rules {
-            if rule.extensions.is_empty() {
-                return Err("every cache rule needs at least one extension".to_string());
-            }
-            for extension in &rule.extensions {
-                if extension.is_empty() || !extension.bytes().all(|b| b.is_ascii_alphanumeric()) {
-                    return Err(format!(
-                        "invalid extension '{extension}' in a cache rule: use letters and digits only, without a dot"
-                    ));
-                }
-            }
-            if rule.cache_control.trim().is_empty() || !is_plain_header_text(&rule.cache_control) {
-                return Err(
-                    "every cache rule needs a cache_control value made of printable ASCII characters"
-                        .to_string(),
-                );
-            }
-        }
-        if self.proxy_connect_timeout_secs == 0 {
-            return Err("proxy_connect_timeout_secs must be at least 1".to_string());
-        }
-        if self.proxy_max_response_bytes == 0 || self.proxy_max_response_bytes > 256 * 1024 * 1024 {
-            return Err(
-                "proxy_max_response_bytes must be between 1 and 268435456 (256 MiB), because responses are held in memory"
-                    .to_string(),
-            );
-        }
-        let mut seen: Vec<&str> = Vec::new();
-        for route in &self.proxy {
-            route.validate()?;
-            if seen.contains(&route.prefix.as_str()) {
-                return Err(format!("the proxy prefix '{}' is used twice", route.prefix));
-            }
-            seen.push(route.prefix.as_str());
-        }
-        Ok(())
     }
 
     /// The address to listen on, like "127.0.0.1:8080".
@@ -610,5 +702,89 @@ timeout_secs = 5
                 "should reject: {text}"
             );
         }
+    }
+
+    #[test]
+    fn a_good_config_has_no_problems() {
+        assert!(Config::default().problems().is_empty());
+    }
+
+    #[test]
+    fn every_problem_is_reported_at_once() {
+        let config = Config {
+            port: 0,
+            max_connections: 0,
+            read_timeout_secs: 0,
+            tls_cert_path: Some("cert.pem".to_string()),
+            ..Config::default()
+        };
+        let problems = config.problems();
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("port must not be 0")));
+        assert!(problems.iter().any(|p| p.contains("max_connections")));
+        assert!(problems.iter().any(|p| p.contains("read_timeout_secs")));
+        assert!(problems.iter().any(|p| p.contains("together")));
+    }
+
+    #[test]
+    fn validate_joins_the_problems() {
+        let config = Config {
+            port: 0,
+            max_connections: 0,
+            ..Config::default()
+        };
+        let message = config.validate().unwrap_err();
+        assert!(message.contains("port must not be 0"));
+        assert!(message.contains("max_connections"));
+    }
+
+    #[test]
+    fn logging_and_status_settings_have_safe_defaults() {
+        let config = Config::from_toml_str("").unwrap();
+        assert!(config.access_log);
+        assert!(!config.log_query_strings);
+        assert!(!config.status_page);
+        assert_eq!(config.status_allowed_ips, vec!["127.0.0.1", "::1"]);
+    }
+
+    #[test]
+    fn loopback_may_see_the_status_page_by_default() {
+        let config = Config::default();
+        assert!(config.status_ip_allowed("127.0.0.1".parse().unwrap()));
+        assert!(config.status_ip_allowed("::1".parse().unwrap()));
+        assert!(config.status_ip_allowed("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!config.status_ip_allowed("203.0.113.9".parse().unwrap()));
+        assert!(!config.status_ip_allowed("::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn bad_status_addresses_are_rejected() {
+        assert!(Config::from_toml_str("status_allowed_ips = [\"not an address\"]").is_err());
+        assert!(Config::from_toml_str("status_allowed_ips = [\"10.0.0.0/8\"]").is_err());
+        assert!(Config::from_toml_str("status_page = true\nstatus_allowed_ips = []").is_err());
+        assert!(Config::from_toml_str("status_allowed_ips = []").is_ok());
+        assert!(
+            Config::from_toml_str(
+                "status_page = true\nstatus_allowed_ips = [\"10.1.2.3\", \"2001:db8::1\"]"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn environment_problems_notice_a_missing_document_root() {
+        let missing = Config {
+            document_root: "definitely-not-a-folder".to_string(),
+            ..Config::default()
+        };
+        let problems = missing.environment_problems();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("document_root"));
+
+        let fine = Config {
+            document_root: std::env::temp_dir().to_str().unwrap().to_string(),
+            ..Config::default()
+        };
+        assert!(fine.environment_problems().is_empty());
     }
 }
