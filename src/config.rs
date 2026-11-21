@@ -153,6 +153,8 @@ pub struct Config {
     pub status_page: bool,
     /// The addresses allowed to see it. Exact addresses only.
     pub status_allowed_ips: Vec<String>,
+    /// Most connections one client address may hold open at once (0 = no limit).
+    pub max_connections_per_ip: usize,
     pub max_connections: usize,
 }
 
@@ -188,6 +190,7 @@ impl Default for Config {
             log_query_strings: false,
             status_page: false,
             status_allowed_ips: vec!["127.0.0.1".to_string(), "::1".to_string()],
+            max_connections_per_ip: 100,
             max_connections: 1000,
         }
     }
@@ -786,5 +789,13 @@ timeout_secs = 5
             ..Config::default()
         };
         assert!(fine.environment_problems().is_empty());
+    }
+
+    #[test]
+    fn the_per_address_limit_has_a_default_and_can_be_switched_off() {
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.max_connections_per_ip, 100);
+        let unlimited = Config::from_toml_str("max_connections_per_ip = 0").unwrap();
+        assert_eq!(unlimited.max_connections_per_ip, 0);
     }
 }

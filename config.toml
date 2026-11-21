@@ -14,6 +14,11 @@ write_timeout_secs = 30
 # Most connections handled at once. Extra ones get "503 Service Unavailable".
 max_connections = 1000
 
+# Most connections one client address may hold open at once (0 = no limit).
+# Set this to 0 if a load balancer or another proxy sits in front of this
+# server: every visitor then appears to come from the same address.
+max_connections_per_ip = 100
+
 # How long an idle connection may wait for its next request.
 keep_alive_timeout_secs = 5
 

@@ -8,6 +8,7 @@ use crate::handlers;
 use crate::http::parser::ParseError;
 use crate::http::request::Method;
 use crate::http::response::{FileSlice, Response};
+use crate::ip_limit::IpLimiter;
 use crate::logging::{loggable_target, sanitize_for_log};
 use crate::metrics::Metrics;
 use crate::net_util::{is_routine_disconnect, write_all_timeout};
@@ -62,6 +63,7 @@ struct Shared {
     config: Config,
     router: Router,
     limiter: Arc<Semaphore>,
+    ip_limiter: Arc<IpLimiter>,
     metrics: Metrics,
 }
 
@@ -73,6 +75,7 @@ pub struct Server {
     config: Config,
     router: Router,
     limiter: Arc<Semaphore>,
+    ip_limiter: Arc<IpLimiter>,
     metrics: Metrics,
 }
 
@@ -107,6 +110,7 @@ impl Server {
             http_kind,
             https,
             limiter: Arc::new(Semaphore::new(config.max_connections)),
+            ip_limiter: IpLimiter::new(config.max_connections_per_ip),
             router: build_router(),
             metrics: Metrics::new(),
             config,
@@ -139,6 +143,7 @@ impl Server {
             config,
             router,
             limiter,
+            ip_limiter,
             metrics,
         } = self;
 
@@ -148,6 +153,7 @@ impl Server {
             config,
             router,
             limiter: Arc::clone(&limiter),
+            ip_limiter,
             metrics,
         });
 
@@ -239,6 +245,10 @@ async fn accept_loop(
         debug!("New connection from {addr}");
         shared.metrics.connection_accepted();
 
+        // Small responses should leave at once. Waiting to bundle them with
+        // later bytes (Nagle's algorithm) only adds delay for a web server.
+        let _ = stream.set_nodelay(true);
+
         let permit = match Arc::clone(&shared.limiter).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -253,12 +263,26 @@ async fn accept_loop(
             }
         };
 
+        // One address may not hold every place.
+        let ip_guard = match shared.ip_limiter.try_acquire(addr.ip()) {
+            Some(guard) => guard,
+            None => {
+                warn!("too many connections from {}, refusing {addr}", addr.ip());
+                shared.metrics.connection_refused();
+                if !matches!(kind, Listener::Https(_)) {
+                    tokio::spawn(refuse_busy(stream, write_timeout));
+                }
+                continue;
+            }
+        };
+
         let shared = Arc::clone(&shared);
         let kind = kind.clone();
         let stop = stop.clone();
         tokio::spawn(async move {
-            // Holding the permit until this task ends keeps the slot taken.
+            // Holding the places until this task ends keeps them taken.
             let _permit = permit;
+            let _ip_guard = ip_guard;
             if let Err(e) = serve_connection(stream, addr, kind, shared, stop).await {
                 if is_routine_disconnect(&e) {
                     debug!("{addr}: connection ended early: {e}");
@@ -332,7 +356,40 @@ where
     // on purpose", as opposed to "the connection was cut off".
     let _ = tokio::time::timeout(Duration::from_secs(2), stream.shutdown()).await;
 
+    // Then give the client a moment to finish what it was sending.
+    linger(&mut stream).await;
+
     result
+}
+
+/// After saying goodbye, keep reading (and throwing away) whatever the
+/// client is still sending, for a short while.
+///
+/// If we closed a connection while unread data was still arriving, the
+/// operating system would answer with a "reset", which can destroy OUR
+/// answer (for example "413 Payload Too Large") before the client has read
+/// it. The wait is short and the amount thrown away is capped, so this
+/// cannot be used to hold a connection open.
+async fn linger<S: AsyncRead + Unpin>(stream: &mut S) {
+    const MAX_DISCARD_BYTES: usize = 256 * 1024;
+    const MAX_WAIT: Duration = Duration::from_secs(1);
+
+    let _ = tokio::time::timeout(MAX_WAIT, async {
+        let mut sink = [0u8; 4096];
+        let mut discarded = 0usize;
+        loop {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    discarded += n;
+                    if discarded >= MAX_DISCARD_BYTES {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await;
 }
 
 /// Serve requests on one connection until it should close.
